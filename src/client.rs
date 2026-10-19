@@ -555,9 +555,7 @@ impl Client {
     /// print `no coordinator operates`: it reports the limit instead, and the
     /// exit code says that qex stopped waiting.
     pub fn connect_existing_result() -> Result<Option<Self>> {
-        let Ok(socket) = paths::socket_path() else {
-            return Ok(None);
-        };
+        let socket = paths::socket_path().map_err(name_the_sandbox)?;
         match try_connect(&socket)? {
             Some(stream) => Ok(Some(Client::with_stream(stream)?)),
             None => Ok(None),
@@ -975,8 +973,8 @@ fn a_silent_coordinator(waited: Duration) -> String {
 /// Tries to connect inside the limit for a coordinator.
 ///
 /// `Ok(None)` says that NOBODY LISTENS, and a caller may start a coordinator.
-/// An `Err` says that a socket is there and gave no answer, and a caller must
-/// NOT start a second coordinator: two coordinators on one state directory
+/// An `Err` says that the socket gave no answer or the system denied access.
+/// A caller must NOT start a second coordinator: two coordinators on one state directory
 /// each hold the whole budget, and the machine then gets the kill for memory
 /// that qex exists to prevent.
 fn try_connect(socket: &Path) -> Result<Option<UnixStream>> {
@@ -988,6 +986,15 @@ fn try_connect(socket: &Path) -> Result<Option<UnixStream>> {
         return Err(the_reader_limit_passed(spent, "connect to the coordinator"));
     }
     let deadline = deadline_for_one_wait();
+    try_connect_with(socket, started, deadline, paths::connect_within)
+}
+
+fn try_connect_with(
+    socket: &Path,
+    started: Instant,
+    deadline: Instant,
+    mut attempt: impl FnMut(&Path, Duration) -> paths::Connected,
+) -> Result<Option<UnixStream>> {
     loop {
         let left = deadline.saturating_duration_since(Instant::now());
         if left.is_zero() {
@@ -1005,16 +1012,35 @@ fn try_connect(socket: &Path) -> Result<Option<UnixStream>> {
                     .unwrap_or_else(|_| "the log of the coordinator".to_string())
             )));
         }
-        match paths::connect_within(socket, left.min(step_of_a_wait())) {
+        match attempt(socket, left.min(step_of_a_wait())) {
             paths::Connected::Open(stream) => return Ok(Some(stream)),
             paths::Connected::NobodyListens => return Ok(None),
+            paths::Connected::Failed(error) => {
+                reject_connect_refusal(socket, error)?;
+            }
             // The socket is there and it did not answer YET. A busy coordinator
             // answers late, so keep asking until this wait reaches its limit.
-            paths::Connected::NoAnswer => {
-                say_that_qex_still_waits(started, deadline, "a connection to the socket");
-            }
+            paths::Connected::NoAnswer => {}
         }
+        say_that_qex_still_waits(started, deadline, "a connection to the socket");
+        // Unknown failures can return at once. Keep their retry bounded by
+        // the same deadline without using a core for the whole wait.
+        std::thread::sleep(
+            Duration::from_millis(5).min(deadline.saturating_duration_since(Instant::now())),
+        );
     }
+}
+
+fn reject_connect_refusal(socket: &Path, error: std::io::Error) -> Result<()> {
+    if let Some(error) = a_refusal(error) {
+        return Err(name_the_sandbox(anyhow::Error::new(error).context(
+            format!(
+                "qex cannot connect to the coordinator socket {}",
+                socket.display()
+            ),
+        )));
+    }
+    Ok(())
 }
 
 /// Waits until the new coordinator opens its socket.
@@ -1035,8 +1061,12 @@ fn wait_for_socket(socket: &Path, timeout: Duration) -> Result<UnixStream> {
         // whole wait. A socket that is there and gives no answer is not a
         // refusal here: the coordinator is starting, and the next attempt asks
         // again.
-        if let paths::Connected::Open(stream) = paths::connect_within(socket, delay) {
-            return Ok(stream);
+        match paths::connect_within(socket, delay) {
+            paths::Connected::Open(stream) => return Ok(stream),
+            paths::Connected::Failed(error) => {
+                reject_connect_refusal(socket, error)?;
+            }
+            _ => {}
         }
         if !probed && Instant::now() >= probe_at {
             probed = true;
@@ -1167,6 +1197,10 @@ fn classify_refusal(dir: &Path, bind: impl Fn(&Path) -> std::io::Result<()>) -> 
 /// A fault that is not in this list gives no message here, and the caller then
 /// reports the error that it has.
 fn a_refusal(error: std::io::Error) -> Option<std::io::Error> {
+    is_a_refusal(&error).then_some(error)
+}
+
+fn is_a_refusal(error: &std::io::Error) -> bool {
     let refused = matches!(
         error.raw_os_error(),
         Some(libc::EACCES)
@@ -1179,13 +1213,12 @@ fn a_refusal(error: std::io::Error) -> Option<std::io::Error> {
     );
     // A test gives an error with no number of the system, so take the kind as
     // well. `PermissionDenied` is EACCES or EPERM by definition.
-    let refused = refused
+    refused
         || (error.raw_os_error().is_none()
             && matches!(
                 error.kind(),
                 std::io::ErrorKind::PermissionDenied | std::io::ErrorKind::Unsupported
-            ));
-    refused.then_some(error)
+            ))
 }
 
 /// Binds a socket and connects to it.
@@ -1218,9 +1251,11 @@ fn name_the_sandbox(error: anyhow::Error) -> anyhow::Error {
     // and then the fault that it corrects.
     anyhow::anyhow!(
         "{error:#}\n\n\
-         qex could not make the files that it needs. A sandbox that gives qex a read-only \
-         mount, or no permission for that directory, gives this fault.\n\
-         IF YOU ARE AN AGENT: tell the person that you work with. The page for them is \
+         qex could not use the files or Unix socket that it needs. A sandbox that refuses \
+         the socket or gives qex a read-only mount can cause this fault.\n\
+         IF YOU ARE AN AGENT: tell the person that you work with. They must let qex run \
+         outside the sandbox, or give it permission for that socket and directory. \
+         The page for them is \
          https://github.com/stephenc/qex/blob/main/docs/sandbox.md"
     )
 }
@@ -1231,15 +1266,7 @@ fn looks_like_a_sandbox(error: &anyhow::Error) -> bool {
         let Some(io) = cause.downcast_ref::<std::io::Error>() else {
             continue;
         };
-        // EROFS has no name in the stable library of every version that qex
-        // builds with, so take the number.
-        if io.raw_os_error() == Some(libc::EROFS) {
-            return true;
-        }
-        if matches!(
-            io.kind(),
-            std::io::ErrorKind::PermissionDenied | std::io::ErrorKind::Unsupported
-        ) {
+        if is_a_refusal(io) {
             return true;
         }
     }
@@ -1391,6 +1418,91 @@ impl Drop for SpawnLock {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn connect_refusals_are_errors_after_one_attempt() {
+        for code in [
+            libc::EPERM,
+            libc::EACCES,
+            libc::EROFS,
+            libc::EAFNOSUPPORT,
+            libc::EPROTONOSUPPORT,
+            libc::EOPNOTSUPP,
+            libc::ENOSYS,
+        ] {
+            let mut attempts = 0;
+            let started = Instant::now();
+            let answer = try_connect_with(
+                Path::new("/test/coordinator"),
+                started,
+                started + Duration::from_secs(1),
+                |_, _| {
+                    attempts += 1;
+                    paths::Connected::Failed(std::io::Error::from_raw_os_error(code))
+                },
+            );
+            let error = match answer {
+                Err(error) => error,
+                Ok(_) => panic!("a refusal must not report a connection or an absent coordinator"),
+            };
+            assert_eq!(attempts, 1);
+            assert!(!is_a_coordinator_timeout(&error));
+            let said = format!("{error:#}");
+            assert!(said.contains("/test/coordinator"), "{said}");
+            assert!(said.contains("docs/sandbox.md"), "{said}");
+            assert!(said.contains("outside the sandbox"), "{said}");
+            assert!(
+                said.contains(&std::io::Error::from_raw_os_error(code).to_string()),
+                "{said}"
+            );
+        }
+    }
+
+    #[test]
+    fn connect_unknown_failures_wait_without_a_hot_loop() {
+        for failed in [false, true] {
+            let mut attempts = 0;
+            let started = Instant::now();
+            let answer = try_connect_with(
+                Path::new("/test/coordinator"),
+                started,
+                started + Duration::from_millis(40),
+                |_, _| {
+                    attempts += 1;
+                    if failed {
+                        paths::Connected::Failed(std::io::Error::from_raw_os_error(libc::EMFILE))
+                    } else {
+                        paths::Connected::NoAnswer
+                    }
+                },
+            );
+            assert!(matches!(answer, Err(ref error) if is_a_coordinator_timeout(error)));
+            assert!((1..=10).contains(&attempts), "{attempts} attempts in 40ms");
+        }
+    }
+
+    #[test]
+    fn connect_keeps_waiting_for_a_late_connection() {
+        let (stream, _peer) = UnixStream::pair().unwrap();
+        let mut stream = Some(stream);
+        let mut attempts = 0;
+        let started = Instant::now();
+        let answer = try_connect_with(
+            Path::new("/test/coordinator"),
+            started,
+            started + Duration::from_secs(1),
+            |_, _| {
+                attempts += 1;
+                if attempts < 4 {
+                    paths::Connected::NoAnswer
+                } else {
+                    paths::Connected::Open(stream.take().unwrap())
+                }
+            },
+        );
+        assert!(matches!(answer, Ok(Some(_))));
+        assert_eq!(attempts, 4);
+    }
 
     /// A connection that reached a limit must never be read again.
     ///
