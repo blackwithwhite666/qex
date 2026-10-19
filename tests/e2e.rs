@@ -16725,7 +16725,12 @@ fn the_ownership_of_a_job_survives_a_new_coordinator() {
     let info: serde_json::Value =
         serde_json::from_str(&h.ok(&["info", "--no-start", "--json"])).unwrap();
     let pid = info["pid"].as_i64().unwrap() as i32;
-    unsafe { libc::kill(pid, libc::SIGKILL) };
+    assert_eq!(
+        unsafe { libc::kill(pid, libc::SIGKILL) },
+        0,
+        "the test cannot stop the coordinator: {}",
+        std::io::Error::last_os_error()
+    );
 
     // `qex run` meets the loss, finds the new coordinator, and asks it again.
     //
@@ -16733,13 +16738,24 @@ fn the_ownership_of_a_job_survives_a_new_coordinator() {
     // ends before it binds loses the ownership in silence, so the number
     // belongs in the failure.
     let killed_at = Instant::now();
-    h.until("a new coordinator answers", Duration::from_secs(40), || {
-        h.state_of(&id) == "queued" && {
-            let fresh: serde_json::Value =
-                serde_json::from_str(&h.ok(&["info", "--json"])).unwrap();
-            fresh["pid"].as_i64().unwrap() as i32 != pid
-        }
-    });
+    let restart_deadline = killed_at + Duration::from_secs(40);
+    // A status request can connect before SIGKILL closes the old socket.
+    h.until(
+        "the coordinator stopped",
+        restart_deadline.saturating_duration_since(Instant::now()),
+        || (unsafe { libc::kill(pid, 0) }) != 0,
+    );
+    h.until(
+        "a new coordinator answers",
+        restart_deadline.saturating_duration_since(Instant::now()),
+        || {
+            h.state_of(&id) == "queued" && {
+                let fresh: serde_json::Value =
+                    serde_json::from_str(&h.ok(&["info", "--json"])).unwrap();
+                fresh["pid"].as_i64().unwrap() as i32 != pid
+            }
+        },
+    );
 
     let new_coordinator_took = killed_at.elapsed();
 
