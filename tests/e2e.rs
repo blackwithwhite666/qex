@@ -218,8 +218,12 @@ impl Harness {
     /// resolves the id, so it cannot bound a fault before that point.
     fn qex_within(&self, args: &[&str], limit: Duration) -> Output {
         let shown = args.join(" ");
-        let mut child = self
-            .command(args)
+        self.command_until(self.command(args), &shown, Instant::now() + limit)
+    }
+
+    fn command_until(&self, mut command: Command, shown: &str, deadline: Instant) -> Output {
+        let limit = deadline.saturating_duration_since(Instant::now());
+        let mut child = command
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
             .spawn()
@@ -250,14 +254,13 @@ impl Harness {
         // in the table of processes until the kill, and the number always
         // names this command. A number that a test reads after a different
         // process reaps the child can name a later process.
-        let started = Instant::now();
         let status = loop {
             match child
                 .try_wait()
                 .unwrap_or_else(|e| panic!("the test cannot read `qex {shown}`: {e}"))
             {
                 Some(status) => break status,
-                None if started.elapsed() >= limit => {
+                None if Instant::now() >= deadline => {
                     // Stop the command first. The pipes then close, so each
                     // reader ends and gives what the command wrote.
                     child.kill().ok();
@@ -16828,6 +16831,138 @@ fn the_ownership_of_a_job_survives_a_new_coordinator() {
 /// The tests below bound themselves ABOVE this number, so a command that keeps
 /// its limit passes and a command with no limit fails.
 const COORDINATOR_LIMIT_SECS: u64 = 3;
+
+fn check_connect_refusal(name: &str, configure: impl Fn(&mut Command, &Path)) {
+    use std::os::unix::fs::MetadataExt;
+
+    struct RestoreMode<'a>(&'a Path);
+    impl Drop for RestoreMode<'_> {
+        fn drop(&mut self) {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = || std::fs::Permissions::from_mode(0o700);
+            std::fs::set_permissions(self.0.parent().unwrap(), mode()).unwrap();
+            std::fs::set_permissions(self.0, mode()).unwrap();
+        }
+    }
+
+    let h = Harness::with_default_config(name);
+    let run = h.root.join("state/qex/run");
+    std::fs::create_dir_all(&run).unwrap();
+    let socket = run.join("s");
+    let _listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+    let inode = std::fs::metadata(&socket).unwrap().ino();
+    // One deadline covers both public connection paths. The old client spins
+    // until its 300-second ceiling, so the harness must stop and reap it.
+    let deadline = Instant::now() + Duration::from_secs(2);
+    for args in [&["version"][..], &["submit", "--", "true"][..]] {
+        let mut command = h.command(args);
+        let restore = RestoreMode(&socket);
+        configure(&mut command, &socket);
+        let out = h.command_until(command, &args.join(" "), deadline);
+        drop(restore);
+        let said = String::from_utf8_lossy(&out.stderr);
+        assert!(!out.status.success(), "permission denial must fail");
+        assert_ne!(
+            out.status.code(),
+            Some(124),
+            "a refusal is not a timeout: {said}"
+        );
+        assert!(said.contains(socket.to_str().unwrap()), "{said}");
+        assert!(said.contains("docs/sandbox.md"), "{said}");
+        assert!(
+            said.contains("permission") || said.contains("permitted"),
+            "{said}"
+        );
+        assert!(
+            !run.join("spawn.lock").exists(),
+            "a refusal must not take the spawn lock"
+        );
+        assert!(
+            !run.join("daemon.log").exists(),
+            "a refusal must not start a coordinator"
+        );
+        assert_eq!(std::fs::metadata(&socket).unwrap().ino(), inode);
+    }
+}
+
+#[test]
+fn connect_directory_denial_returns_at_once() {
+    if unsafe { libc::geteuid() } == 0 {
+        eprintln!("this test did not run: root can enter a directory with no permissions");
+        return;
+    }
+    check_connect_refusal("denydir", |_, socket| {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(
+            socket.parent().unwrap(),
+            std::fs::Permissions::from_mode(0o000),
+        )
+        .unwrap();
+    });
+}
+
+#[test]
+#[cfg(target_os = "linux")]
+fn connect_permission_denial_returns_at_once() {
+    if unsafe { libc::geteuid() } == 0 {
+        eprintln!("this test did not run: root can connect through a socket with no permissions");
+        return;
+    }
+    check_connect_refusal("denyconnect", |_, socket| {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(socket, std::fs::Permissions::from_mode(0o000)).unwrap();
+    });
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn connect_sandbox_denial_returns_at_once() {
+    check_connect_refusal("denyseccomp", |command, _| {
+        use std::os::unix::process::CommandExt;
+        // Deny connect only in this child. The socket file remains visible,
+        // as it does in an agent sandbox that returns EPERM from connect.
+        unsafe {
+            command.pre_exec(|| {
+                let mut filter = [
+                    libc::sock_filter {
+                        code: 0x20,
+                        jt: 0,
+                        jf: 0,
+                        k: 0,
+                    },
+                    libc::sock_filter {
+                        code: 0x15,
+                        jt: 0,
+                        jf: 1,
+                        k: libc::SYS_connect as u32,
+                    },
+                    libc::sock_filter {
+                        code: 0x06,
+                        jt: 0,
+                        jf: 0,
+                        k: libc::SECCOMP_RET_ERRNO | libc::EPERM as u32,
+                    },
+                    libc::sock_filter {
+                        code: 0x06,
+                        jt: 0,
+                        jf: 0,
+                        k: libc::SECCOMP_RET_ALLOW,
+                    },
+                ];
+                let program = libc::sock_fprog {
+                    len: filter.len() as u16,
+                    filter: filter.as_mut_ptr(),
+                };
+                if libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0
+                    || libc::prctl(libc::PR_SET_SECCOMP, libc::SECCOMP_MODE_FILTER, &program) != 0
+                {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+    });
+}
 
 /// Names the variable that gives the ceiling for a coordinator a short value.
 fn qex_ceiling_variable() -> String {

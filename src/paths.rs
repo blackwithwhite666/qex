@@ -692,6 +692,14 @@ fn answer_of(error: Option<i32>) -> SocketAnswer {
 ///
 /// The result is `None` when the caller can try again.
 fn finish_connect(fd: libc::c_int, deadline: std::time::Instant) -> Option<SocketAnswer> {
+    finish_open(fd, deadline).map(|answer| match answer {
+        Ok(()) => SocketAnswer::Answers,
+        Err(error) => answer_of(error.raw_os_error()),
+    })
+}
+
+/// Keeps the system error for a caller that needs to explain a refusal.
+fn finish_open(fd: libc::c_int, deadline: std::time::Instant) -> Option<std::io::Result<()>> {
     let left = deadline.saturating_duration_since(std::time::Instant::now());
     let mut waiting = libc::pollfd {
         fd,
@@ -708,12 +716,13 @@ fn finish_connect(fd: libc::c_int, deadline: std::time::Instant) -> Option<Socke
     if ready == 0 {
         // The connect did not finish inside the limit. A coordinator can hold
         // this socket, so the answer is not known.
-        return Some(SocketAnswer::Unknown);
+        return Some(Err(std::io::ErrorKind::TimedOut.into()));
     }
     if ready < 0 {
-        return match std::io::Error::last_os_error().raw_os_error() {
+        let error = std::io::Error::last_os_error();
+        return match error.raw_os_error() {
             Some(libc::EINTR) => None,
-            other => Some(answer_of(other)),
+            _ => Some(Err(error)),
         };
     }
 
@@ -729,15 +738,15 @@ fn finish_connect(fd: libc::c_int, deadline: std::time::Instant) -> Option<Socke
         )
     };
     if read != 0 {
-        return Some(SocketAnswer::Unknown);
+        return Some(Err(std::io::Error::last_os_error()));
     }
     if error == 0 {
-        return Some(SocketAnswer::Answers);
+        return Some(Ok(()));
     }
     if error == libc::EAGAIN || error == libc::EINTR {
         return None;
     }
-    Some(answer_of(Some(error)))
+    Some(Err(std::io::Error::from_raw_os_error(error)))
 }
 
 /// Makes one attempt to connect, and never blocks.
@@ -790,7 +799,7 @@ fn connect_once(address: &libc::sockaddr_un, deadline: std::time::Instant) -> Op
 /// The answer of a connect that KEEPS the connection.
 ///
 /// `ask_socket` tests a socket and closes what it opened. A command needs the
-/// connection itself, and it needs the three answers apart, because the answer
+/// connection itself, and it needs the answers apart, because the answer
 /// decides whether qex may start a coordinator.
 pub enum Connected {
     /// A coordinator accepted, and this is the connection to it.
@@ -800,6 +809,9 @@ pub enum Connected {
     /// The socket gave no answer inside the limit. A process can hold that
     /// socket, so a caller MUST NOT start a second coordinator.
     NoAnswer,
+    /// The system rejected the attempt. This is not proof of an absent
+    /// coordinator. The caller decides whether the error permits a retry.
+    Failed(std::io::Error),
 }
 
 /// Connects to a socket inside `limit`, and gives the connection back.
@@ -826,7 +838,7 @@ pub fn connect_within(socket: &std::path::Path, limit: std::time::Duration) -> C
     if let Err(e) = std::fs::symlink_metadata(socket) {
         return match e.kind() {
             std::io::ErrorKind::NotFound => Connected::NobodyListens,
-            _ => Connected::NoAnswer,
+            _ => Connected::Failed(e),
         };
     }
     let Some(address) = unix_address(socket) else {
@@ -843,14 +855,19 @@ pub fn connect_within(socket: &std::path::Path, limit: std::time::Duration) -> C
                 unsafe {
                     let flags = libc::fcntl(fd, libc::F_GETFL);
                     if flags < 0 || libc::fcntl(fd, libc::F_SETFL, flags & !libc::O_NONBLOCK) < 0 {
+                        let error = std::io::Error::last_os_error();
                         libc::close(fd);
-                        return Connected::NoAnswer;
+                        return Connected::Failed(error);
                     }
                     return Connected::Open(std::os::unix::net::UnixStream::from_raw_fd(fd));
                 }
             }
-            Some(Err(SocketAnswer::NobodyListens)) => return Connected::NobodyListens,
-            Some(Err(_)) => return Connected::NoAnswer,
+            Some(Err(error)) => {
+                return match answer_of(error.raw_os_error()) {
+                    SocketAnswer::NobodyListens => Connected::NobodyListens,
+                    _ => Connected::Failed(error),
+                };
+            }
             None => {
                 if std::time::Instant::now() >= deadline {
                     return Connected::NoAnswer;
@@ -868,16 +885,17 @@ pub fn connect_within(socket: &std::path::Path, limit: std::time::Duration) -> C
 fn open_once(
     address: &libc::sockaddr_un,
     deadline: std::time::Instant,
-) -> Option<Result<libc::c_int, SocketAnswer>> {
+) -> Option<std::io::Result<libc::c_int>> {
     unsafe {
         let fd = libc::socket(libc::AF_UNIX, libc::SOCK_STREAM, 0);
         if fd < 0 {
-            return Some(Err(SocketAnswer::Unknown));
+            return Some(Err(std::io::Error::last_os_error()));
         }
         let flags = libc::fcntl(fd, libc::F_GETFL);
         if flags < 0 || libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) < 0 {
+            let error = std::io::Error::last_os_error();
             libc::close(fd);
-            return Some(Err(SocketAnswer::Unknown));
+            return Some(Err(error));
         }
         let result = libc::connect(
             fd,
@@ -887,15 +905,15 @@ fn open_once(
         if result == 0 {
             return Some(Ok(fd));
         }
-        let error = std::io::Error::last_os_error().raw_os_error();
-        let answer = match error {
-            Some(libc::EINPROGRESS) => match finish_connect(fd, deadline) {
-                Some(SocketAnswer::Answers) => return Some(Ok(fd)),
-                Some(other) => Some(Err(other)),
+        let error = std::io::Error::last_os_error();
+        let answer = match error.raw_os_error() {
+            Some(libc::EINPROGRESS) => match finish_open(fd, deadline) {
+                Some(Ok(())) => return Some(Ok(fd)),
+                Some(Err(error)) => Some(Err(error)),
                 None => None,
             },
             Some(libc::EAGAIN) | Some(libc::EINTR) => None,
-            other => Some(Err(answer_of(other))),
+            _ => Some(Err(error)),
         };
         libc::close(fd);
         answer
@@ -1024,6 +1042,8 @@ mod tests {
 
         let answer = connect_within(&hidden, std::time::Duration::from_millis(50));
         let says_nobody = matches!(answer, Connected::NobodyListens);
+        let denied = matches!(answer, Connected::Failed(ref error)
+            if error.kind() == std::io::ErrorKind::PermissionDenied);
 
         std::fs::set_permissions(&shut, std::os::unix::fs::PermissionsExt::from_mode(0o700)).ok();
         std::fs::remove_dir_all(&dir).ok();
@@ -1038,6 +1058,10 @@ mod tests {
             !says_nobody,
             "a socket that qex cannot look at must not say that nobody listens: \
              that answer lets a caller start a SECOND coordinator"
+        );
+        assert!(
+            denied,
+            "a directory permission denial must keep its system error"
         );
     }
 
