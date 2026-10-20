@@ -420,6 +420,11 @@ the name, because `cargo build` and `cargo test` need different sizes. qex uses
 the **largest** measurement it holds plus a margin, because a claim that is too
 small stops the job while a claim that is a little large costs only capacity.
 
+When Git identifies a linked worktree, qex uses the original checkout and the
+same relative directory for learning. A claim learned in one linked worktree
+is available in another. qex still runs the job in the directory you gave it.
+If Git cannot identify the checkout, qex uses the directory path as before.
+
 qex records ONE kind of measurement: the memory that a job which COMPLETED
 used. A job that something stopped shows the memory that it reached, and not the
 memory that it needs, so it teaches the learner nothing. That covers a job that

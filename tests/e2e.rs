@@ -5764,6 +5764,275 @@ fn a_second_job_of_one_command_uses_the_measurement_of_the_first() {
     h.ok(&["wait", &second, "--timeout", "60s"]);
 }
 
+struct LearningWorktrees {
+    root: PathBuf,
+    primary: PathBuf,
+    linked: PathBuf,
+    linked_added: bool,
+}
+
+impl LearningWorktrees {
+    fn new() -> Self {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let base = std::env::var_os("QEX_TEST_WORKTREE_ROOT")
+            .map(PathBuf::from)
+            .unwrap_or_else(std::env::temp_dir);
+        std::fs::create_dir_all(&base).unwrap();
+        let root = base.join(format!(
+            "qex-e2e-learning-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        std::fs::create_dir(&root).unwrap();
+        let mut fixture = Self {
+            primary: root.join("primary"),
+            linked: root.join("linked"),
+            root,
+            linked_added: false,
+        };
+        fixture.initialize();
+        fixture
+    }
+
+    fn initialize(&mut self) {
+        std::fs::create_dir(&self.primary).unwrap();
+        std::fs::write(self.primary.join("marker.txt"), "primary\n").unwrap();
+        git_fixture(&self.primary, &["init", "--quiet"]);
+        git_fixture(
+            &self.primary,
+            &[
+                "-c",
+                "user.name=qex test",
+                "-c",
+                "user.email=qex-test@example.invalid",
+                "-c",
+                "core.hooksPath=/dev/null",
+                "add",
+                ".",
+            ],
+        );
+        git_fixture(
+            &self.primary,
+            &[
+                "-c",
+                "user.name=qex test",
+                "-c",
+                "user.email=qex-test@example.invalid",
+                "-c",
+                "core.hooksPath=/dev/null",
+                "commit",
+                "--quiet",
+                "-m",
+                "fixture",
+            ],
+        );
+        git_fixture(
+            &self.primary,
+            &[
+                "worktree",
+                "add",
+                "--quiet",
+                "-b",
+                "fixture-linked",
+                self.linked.to_str().unwrap(),
+            ],
+        );
+        self.linked_added = true;
+        std::fs::write(self.linked.join("marker.txt"), "linked\n").unwrap();
+    }
+}
+
+impl Drop for LearningWorktrees {
+    fn drop(&mut self) {
+        if !self.linked_added {
+            if let Err(error) = std::fs::remove_dir_all(&self.root) {
+                eprintln!(
+                    "could not remove incomplete qex end-to-end Git fixture {}: {error}",
+                    self.root.display()
+                );
+            }
+            return;
+        }
+        let clean = std::fs::write(self.linked.join("marker.txt"), "primary\n").is_ok()
+            && [
+                self.primary.join("result.txt"),
+                self.primary.join("actual-cwd.txt"),
+                self.linked.join("result.txt"),
+                self.linked.join("actual-cwd.txt"),
+            ]
+            .into_iter()
+            .all(|path| remove_fixture_file(&path));
+        let removed = clean
+            && git_fixture_result(
+                &self.primary,
+                &["worktree", "remove", self.linked.to_str().unwrap()],
+            );
+        if removed {
+            if let Err(error) = std::fs::remove_dir_all(&self.root) {
+                eprintln!(
+                    "could not remove qex end-to-end Git fixture {}: {error}",
+                    self.root.display()
+                );
+            }
+        } else {
+            eprintln!(
+                "kept qex end-to-end Git fixture after cleanup failed: {}",
+                self.root.display()
+            );
+        }
+    }
+}
+
+fn remove_fixture_file(path: &Path) -> bool {
+    match std::fs::remove_file(path) {
+        Ok(()) => true,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => true,
+        Err(_) => false,
+    }
+}
+
+fn git_fixture(cwd: &Path, args: &[&str]) {
+    let output = git_fixture_command(cwd, args);
+    assert!(
+        output.status.success(),
+        "git {args:?} failed in {}\n{}",
+        cwd.display(),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+fn git_fixture_result(cwd: &Path, args: &[&str]) -> bool {
+    git_fixture_command(cwd, args).status.success()
+}
+
+fn git_fixture_command(cwd: &Path, args: &[&str]) -> Output {
+    Command::new("git")
+        .arg("-C")
+        .arg(cwd)
+        .args(args)
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env_remove("GIT_DIR")
+        .env_remove("GIT_WORK_TREE")
+        .env_remove("GIT_COMMON_DIR")
+        .env_remove("GIT_INDEX_FILE")
+        .stdin(std::process::Stdio::null())
+        .output()
+        .expect("git must be available for the linked-worktree test")
+}
+
+/// Learned history crosses linked worktrees while the job still uses the
+/// requested worktree for its cwd and output files.
+#[test]
+fn learned_claims_cross_linked_worktrees_without_changing_execution_cwd() {
+    let scenario_deadline = Instant::now() + Duration::from_secs(60);
+    let work_deadline = scenario_deadline - Duration::from_secs(5);
+    let fixture = LearningWorktrees::new();
+    let h = Harness::with_default_config("learn-worktrees");
+    let run_ok = |args: &[&str]| {
+        let shown = args.join(" ");
+        let out = h.command_until(h.command(args), &shown, work_deadline);
+        assert!(
+            out.status.success(),
+            "the command `qex {shown}` failed with the code {:?}\nstdout: {}\nstderr: {}",
+            out.status.code(),
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    };
+    let program = [
+        "sh",
+        "-c",
+        "pwd > actual-cwd.txt; cat marker.txt > result.txt; head -c 40000000 /dev/zero | tail -c 1 > /dev/null",
+    ];
+    let primary = fixture.primary.to_str().unwrap();
+    let linked = fixture.linked.to_str().unwrap();
+    let first_args = [
+        &["submit", "--cwd", primary, "--name", "primary", "--"][..],
+        &program,
+    ]
+    .concat();
+    let first = run_ok(&first_args);
+    assert_eq!(
+        first.lines().count(),
+        1,
+        "submit must write the id only: {first}"
+    );
+    assert!(
+        first.parse::<uuid::Uuid>().is_ok(),
+        "invalid job id: {first}"
+    );
+    run_ok(&["wait", &first, "--timeout", "60s"]);
+    let first_status: serde_json::Value =
+        serde_json::from_str(&run_ok(&["status", &first, "--json"]))
+            .expect("the status output is not valid JSON");
+    assert_eq!(first_status["claim_source"], "default");
+    let usage_file = h.root.join("state/qex/usage.json");
+    let remaining = work_deadline.saturating_duration_since(Instant::now());
+    assert!(
+        !remaining.is_zero(),
+        "the work deadline expired before usage was recorded"
+    );
+    h.until(
+        "the first job's usage sample is recorded",
+        remaining,
+        || {
+            let Ok(text) = std::fs::read_to_string(&usage_file) else {
+                return false;
+            };
+            let Ok(store) = serde_json::from_str::<serde_json::Value>(&text) else {
+                return false;
+            };
+            store["commands"].as_object().is_some_and(|commands| {
+                commands.values().any(|entry| {
+                    entry["name"] == "primary"
+                        && entry["samples"]
+                            .as_array()
+                            .is_some_and(|samples| !samples.is_empty())
+                })
+            })
+        },
+    );
+
+    let second_args = [
+        &["submit", "--cwd", linked, "--name", "linked", "--"][..],
+        &program,
+    ]
+    .concat();
+    let second = run_ok(&second_args);
+    assert_eq!(
+        second.lines().count(),
+        1,
+        "submit must write the id only: {second}"
+    );
+    assert!(
+        second.parse::<uuid::Uuid>().is_ok(),
+        "invalid job id: {second}"
+    );
+    let second_status: serde_json::Value =
+        serde_json::from_str(&run_ok(&["status", &second, "--json"]))
+            .expect("the status output is not valid JSON");
+    assert_eq!(second_status["claim_source"], "learned", "{second_status}");
+    assert_eq!(second_status["cwd"], linked);
+    assert_eq!(second_status["command"], first_status["command"]);
+    run_ok(&["wait", &second, "--timeout", "60s"]);
+
+    assert_eq!(
+        std::fs::read_to_string(fixture.linked.join("actual-cwd.txt"))
+            .unwrap()
+            .trim(),
+        linked
+    );
+    assert_eq!(
+        std::fs::read_to_string(fixture.linked.join("result.txt")).unwrap(),
+        "linked\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(fixture.primary.join("result.txt")).unwrap(),
+        "primary\n"
+    );
+}
+
 /// A claim from the user must always win over a measurement.
 ///
 /// The claim of the user is 128MB and not more, because the job must start.
