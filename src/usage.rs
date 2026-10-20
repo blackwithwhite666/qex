@@ -200,6 +200,8 @@ pub struct Suggestion {
 pub fn key(cwd: &std::path::Path, command: &[String]) -> String {
     let mut hash: u64 = 0xcbf29ce484222325;
 
+    let cwd = history_cwd(cwd);
+
     // The directory comes first. `cargo test` in a small library and the same
     // command in a large program need very different claims.
     for byte in cwd.to_string_lossy().as_bytes() {
@@ -219,6 +221,72 @@ pub fn key(cwd: &std::path::Path, command: &[String]) -> String {
         hash = hash.wrapping_mul(0x100000001b3);
     }
     format!("{hash:016x}")
+}
+
+/// Gives the directory identity used by the learner.
+///
+/// A linked worktree is another checkout of the same local repository. Use
+/// its original checkout plus the path below the worktree root, so it can use
+/// the original checkout's measurements. Keep the path unchanged for the
+/// original checkout and for paths that Git cannot identify.
+fn history_cwd(cwd: &std::path::Path) -> std::path::PathBuf {
+    use std::os::unix::ffi::{OsStrExt, OsStringExt};
+
+    fn git(cwd: &std::path::Path, args: &[&str]) -> Option<Vec<u8>> {
+        let output = std::process::Command::new("git")
+            .arg("-C")
+            .arg(cwd)
+            .args(args)
+            .env_remove("GIT_DIR")
+            .env_remove("GIT_WORK_TREE")
+            .env_remove("GIT_COMMON_DIR")
+            .env_remove("GIT_INDEX_FILE")
+            .stdin(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .output()
+            .ok()?;
+        output.status.success().then_some(output.stdout)
+    }
+
+    let Some(top) = git(cwd, &["rev-parse", "--show-toplevel"]) else {
+        return cwd.to_path_buf();
+    };
+    let top = std::path::PathBuf::from(std::ffi::OsString::from_vec(
+        top.strip_suffix(b"\n").unwrap_or(&top).to_vec(),
+    ));
+    let Ok(top) = std::fs::canonicalize(top) else {
+        return cwd.to_path_buf();
+    };
+
+    let Some(worktrees) = git(cwd, &["worktree", "list", "--porcelain", "-z"]) else {
+        return cwd.to_path_buf();
+    };
+    let Some(first) = worktrees.split(|byte| *byte == 0).next() else {
+        return cwd.to_path_buf();
+    };
+    let Some(primary) = first.strip_prefix(b"worktree ") else {
+        return cwd.to_path_buf();
+    };
+    let primary = std::path::PathBuf::from(std::ffi::OsString::from_vec(primary.to_vec()));
+    let Ok(primary) = std::fs::canonicalize(primary) else {
+        return cwd.to_path_buf();
+    };
+
+    // The original checkout keeps its exact old key, including paths that are
+    // spelled through a symlink.
+    if top == primary {
+        return cwd.to_path_buf();
+    }
+
+    let Some(prefix) = git(cwd, &["rev-parse", "--show-prefix"]) else {
+        return cwd.to_path_buf();
+    };
+    let prefix = prefix.strip_suffix(b"\n").unwrap_or(&prefix);
+    let prefix = prefix.strip_suffix(b"/").unwrap_or(prefix);
+    if prefix.is_empty() {
+        return primary;
+    }
+    primary.join(std::ffi::OsStr::from_bytes(prefix))
 }
 
 fn store_path() -> anyhow::Result<std::path::PathBuf> {
@@ -539,6 +607,264 @@ pub fn suggest(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
+    use std::process::Command;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    struct GitFixture {
+        root: PathBuf,
+        primary: PathBuf,
+        linked: PathBuf,
+        other: PathBuf,
+        linked_added: bool,
+    }
+
+    impl GitFixture {
+        fn new() -> Self {
+            static NEXT: AtomicU64 = AtomicU64::new(0);
+            let base = std::env::var_os("QEX_TEST_WORKTREE_ROOT")
+                .map(PathBuf::from)
+                .unwrap_or_else(std::env::temp_dir);
+            std::fs::create_dir_all(&base).unwrap();
+            let base = std::fs::canonicalize(base).unwrap();
+            let root = base.join(format!(
+                "qex-usage-git-{}-{}",
+                std::process::id(),
+                NEXT.fetch_add(1, Ordering::Relaxed)
+            ));
+            std::fs::create_dir(&root).unwrap();
+            let primary = root.join("primary");
+            let linked = root.join("linked");
+            let other = root.join("other");
+            let mut fixture = Self {
+                root,
+                primary,
+                linked,
+                other,
+                linked_added: false,
+            };
+            fixture.initialize();
+            fixture
+        }
+
+        fn initialize(&mut self) {
+            std::fs::create_dir(&self.primary).unwrap();
+            std::fs::create_dir_all(self.primary.join("src")).unwrap();
+            std::fs::create_dir_all(self.primary.join("docs")).unwrap();
+            std::fs::write(self.primary.join("src/file"), "primary").unwrap();
+            std::fs::write(self.primary.join("docs/file"), "primary docs").unwrap();
+            git_ok(&self.primary, &["init", "--quiet"]);
+            git_ok(
+                &self.primary,
+                &[
+                    "-c",
+                    "user.name=qex test",
+                    "-c",
+                    "user.email=qex-test@example.invalid",
+                    "-c",
+                    "core.hooksPath=/dev/null",
+                    "add",
+                    ".",
+                ],
+            );
+            git_ok(
+                &self.primary,
+                &[
+                    "-c",
+                    "user.name=qex test",
+                    "-c",
+                    "user.email=qex-test@example.invalid",
+                    "-c",
+                    "core.hooksPath=/dev/null",
+                    "commit",
+                    "--quiet",
+                    "-m",
+                    "fixture",
+                ],
+            );
+            git_ok(
+                &self.primary,
+                &[
+                    "worktree",
+                    "add",
+                    "--quiet",
+                    "-b",
+                    "fixture-linked",
+                    self.linked.to_str().unwrap(),
+                ],
+            );
+            self.linked_added = true;
+            std::fs::create_dir_all(self.linked.join("worktree-only")).unwrap();
+            std::fs::write(self.linked.join("worktree-only/file"), "only here").unwrap();
+
+            std::fs::create_dir(&self.other).unwrap();
+            git_ok(&self.other, &["init", "--quiet"]);
+        }
+    }
+
+    impl Drop for GitFixture {
+        fn drop(&mut self) {
+            if !self.linked_added {
+                if let Err(error) = std::fs::remove_dir_all(&self.root) {
+                    eprintln!(
+                        "could not remove incomplete qex usage Git fixture {}: {error}",
+                        self.root.display()
+                    );
+                }
+                return;
+            }
+            let clean = std::fs::remove_file(self.linked.join("worktree-only/file")).is_ok()
+                && std::fs::remove_dir(self.linked.join("worktree-only")).is_ok();
+            let removed = clean
+                && git_ok_result(
+                    &self.primary,
+                    &["worktree", "remove", self.linked.to_str().unwrap()],
+                );
+            if removed {
+                if let Err(error) = std::fs::remove_dir_all(&self.root) {
+                    eprintln!(
+                        "could not remove qex usage Git fixture {}: {error}",
+                        self.root.display()
+                    );
+                }
+            } else {
+                eprintln!(
+                    "kept qex usage Git fixture after cleanup failed: {}",
+                    self.root.display()
+                );
+            }
+        }
+    }
+
+    fn git_ok(cwd: &std::path::Path, args: &[&str]) {
+        assert!(
+            git_ok_result(cwd, args),
+            "git {args:?} failed in {}",
+            cwd.display()
+        );
+    }
+
+    fn git_ok_result(cwd: &std::path::Path, args: &[&str]) -> bool {
+        Command::new("git")
+            .arg("-C")
+            .arg(cwd)
+            .args(args)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env_remove("GIT_DIR")
+            .env_remove("GIT_WORK_TREE")
+            .env_remove("GIT_COMMON_DIR")
+            .env_remove("GIT_INDEX_FILE")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .is_ok_and(|status| status.success())
+    }
+
+    fn legacy_key(cwd: &std::path::Path, command: &[String]) -> String {
+        let mut hash: u64 = 0xcbf29ce484222325;
+        for byte in cwd.to_string_lossy().as_bytes() {
+            hash ^= *byte as u64;
+            hash = hash.wrapping_mul(0x100000001b3);
+        }
+        hash ^= 0xfe;
+        hash = hash.wrapping_mul(0x100000001b3);
+        for part in command {
+            for byte in part.as_bytes() {
+                hash ^= *byte as u64;
+                hash = hash.wrapping_mul(0x100000001b3);
+            }
+            hash ^= 0xff;
+            hash = hash.wrapping_mul(0x100000001b3);
+        }
+        format!("{hash:016x}")
+    }
+
+    #[test]
+    fn linked_worktrees_share_history_and_keep_repository_subdirectory_and_command_separate() {
+        let _lock = crate::testutil::env_lock();
+        let fixture = GitFixture::new();
+        let command = vec!["cargo".into(), "test".into()];
+        let primary_src = fixture.primary.join("src");
+        let linked_src = fixture.linked.join("src");
+        assert_eq!(history_cwd(&primary_src), primary_src);
+        assert_eq!(history_cwd(&linked_src), primary_src);
+        let mut store = Store::default();
+        store.commands.insert(
+            key(&primary_src, &command),
+            Entry {
+                name: "test".into(),
+                samples: vec![sample(256 << 20, 2.0, 1)],
+            },
+        );
+
+        let primary_key = key(&primary_src, &command);
+        let linked_key = key(&linked_src, &command);
+        assert_eq!(
+            primary_key,
+            linked_key,
+            "{} != {}",
+            history_cwd(&primary_src).display(),
+            history_cwd(&linked_src).display()
+        );
+        assert!(suggest(&store, &linked_src, &command, 1.5).is_some());
+        assert_eq!(
+            history_cwd(&fixture.linked.join("worktree-only")),
+            fixture.primary.join("worktree-only"),
+            "the normalized directory need not exist in the primary checkout"
+        );
+        assert!(!fixture.primary.join("worktree-only").exists());
+        assert_ne!(
+            key(&fixture.linked.join("docs"), &command),
+            key(&primary_src, &command)
+        );
+        assert_ne!(key(&fixture.other, &command), key(&primary_src, &command));
+        assert_ne!(
+            key(&linked_src, &["cargo".into(), "check".into()]),
+            key(&linked_src, &command)
+        );
+    }
+
+    #[test]
+    fn primary_and_non_git_paths_keep_the_legacy_key() {
+        let _lock = crate::testutil::env_lock();
+        let fixture = GitFixture::new();
+        let command = vec!["cargo".into(), "test".into()];
+        let plain = fixture.root.join("plain");
+        std::fs::create_dir(&plain).unwrap();
+        assert_eq!(
+            key(&fixture.primary, &command),
+            legacy_key(&fixture.primary, &command)
+        );
+        assert_eq!(key(&plain, &command), legacy_key(&plain, &command));
+    }
+
+    #[test]
+    fn ambient_git_locators_are_ignored_and_missing_git_keeps_the_old_key() {
+        use crate::testutil::{env_lock, EnvVar};
+
+        let _lock = env_lock();
+        let fixture = GitFixture::new();
+        let command = vec!["cargo".into(), "test".into()];
+        let expected = key(&fixture.primary.join("src"), &command);
+        let _git_dir = EnvVar::set("GIT_DIR", fixture.other.join(".git").to_str().unwrap());
+        let _git_work_tree = EnvVar::set("GIT_WORK_TREE", fixture.other.to_str().unwrap());
+        let _git_common_dir = EnvVar::set(
+            "GIT_COMMON_DIR",
+            fixture.other.join(".git").to_str().unwrap(),
+        );
+        assert_eq!(
+            history_cwd(&fixture.linked.join("src")),
+            fixture.primary.join("src")
+        );
+        assert_eq!(key(&fixture.linked.join("src"), &command), expected);
+
+        let _path = EnvVar::set("PATH", "");
+        assert_eq!(
+            key(&fixture.linked.join("src"), &command),
+            legacy_key(&fixture.linked.join("src"), &command)
+        );
+    }
 
     #[test]
     fn a_failed_usage_lock_is_not_an_acquired_lock() {
