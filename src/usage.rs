@@ -626,6 +626,7 @@ mod tests {
                 .map(PathBuf::from)
                 .unwrap_or_else(std::env::temp_dir);
             std::fs::create_dir_all(&base).unwrap();
+            let base = std::fs::canonicalize(base).unwrap();
             let root = base.join(format!(
                 "qex-usage-git-{}-{}",
                 std::process::id(),

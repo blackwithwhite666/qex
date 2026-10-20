@@ -5778,6 +5778,7 @@ impl LearningWorktrees {
             .map(PathBuf::from)
             .unwrap_or_else(std::env::temp_dir);
         std::fs::create_dir_all(&base).unwrap();
+        let base = std::fs::canonicalize(base).unwrap();
         let root = base.join(format!(
             "qex-e2e-learning-{}-{}",
             std::process::id(),
