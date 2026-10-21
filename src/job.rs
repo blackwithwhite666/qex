@@ -747,7 +747,15 @@ impl JobStatus {
 /// An error in any of these steps is an error of this function. A record that
 /// qex could not write is not a record, and a caller must hear that.
 pub fn write_atomic(path: &Path, bytes: &[u8], mode: u32) -> Result<()> {
-    write_atomic_with(path, bytes, mode, true)
+    write_atomic_with(path, bytes, mode, true, false)
+}
+
+/// Writes a public peer record with mode 0644, even with a private umask.
+///
+/// Only peer records use this form. Private job files keep the umask rules of
+/// `write_atomic`.
+pub(crate) fn write_atomic_public_peer(path: &Path, bytes: &[u8]) -> Result<()> {
+    write_atomic_with(path, bytes, 0o644, true, true)
 }
 
 /// Writes a file in one step, and does not wait for the disk.
@@ -758,10 +766,16 @@ pub fn write_atomic(path: &Path, bytes: &[u8], mode: u32) -> Result<()> {
 /// holds a lock that every other request waits for, and where the record
 /// protects against the death of a process and not against a loss of power.
 pub fn write_atomic_unsynced(path: &Path, bytes: &[u8], mode: u32) -> Result<()> {
-    write_atomic_with(path, bytes, mode, false)
+    write_atomic_with(path, bytes, mode, false, false)
 }
 
-fn write_atomic_with(path: &Path, bytes: &[u8], mode: u32, sync: bool) -> Result<()> {
+fn write_atomic_with(
+    path: &Path,
+    bytes: &[u8],
+    mode: u32,
+    sync: bool,
+    public_peer: bool,
+) -> Result<()> {
     use std::io::Write;
     use std::os::unix::fs::OpenOptionsExt;
 
@@ -789,6 +803,14 @@ fn write_atomic_with(path: &Path, bytes: &[u8], mode: u32, sync: bool) -> Result
             .with_context(|| format!("creating {}", tmp.display()))?;
         f.write_all(bytes)
             .with_context(|| format!("writing {}", tmp.display()))?;
+        if public_peer {
+            use std::os::unix::fs::PermissionsExt;
+            // Creation subtracts the umask. Set the mode on the open file
+            // before sync and rename, so other users can read the peer record
+            // as soon as its name appears.
+            f.set_permissions(std::fs::Permissions::from_mode(0o644))
+                .with_context(|| format!("setting public permissions on {}", tmp.display()))?;
+        }
         // Step 1. Write the data to the disk now. If the machine loses power
         // during a job, the status file must not be incomplete after the
         // restart.
