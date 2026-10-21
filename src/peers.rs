@@ -222,7 +222,7 @@ pub fn publish(
     };
 
     if let Ok(bytes) = serde_json::to_vec(&peer) {
-        crate::job::write_atomic(&mine.join(peer_file_name(peer.pid)), &bytes, 0o644).ok();
+        crate::job::write_atomic_public_peer(&mine.join(peer_file_name(peer.pid)), &bytes).ok();
     }
 }
 
@@ -418,6 +418,70 @@ mod tests {
     }
 
     #[test]
+    fn published_records_are_public_under_a_restrictive_umask() {
+        const CHILD_DIR: &str = "QEX_TEST_PEER_UMASK_DIR";
+        const TEST: &str = "peers::tests::published_records_are_public_under_a_restrictive_umask";
+
+        if let Some(dir) = std::env::var_os(CHILD_DIR) {
+            let dir = PathBuf::from(dir);
+            // This ordinary write proves that the child inherited umask 077.
+            let probe = dir.join("umask-probe");
+            std::fs::write(&probe, b"probe").unwrap();
+            assert_eq!(std::fs::metadata(&probe).unwrap().mode() & 0o777, 0o600);
+
+            let private = dir.join("private.json");
+            crate::job::write_atomic(&private, b"private", 0o600).unwrap();
+            assert_eq!(std::fs::metadata(&private).unwrap().mode() & 0o777, 0o600);
+
+            let shared = dir.join("peers");
+            let cfg = cfg_for(&shared);
+            let mine = shared.join(user_dir_name(current_uid()));
+            let path = mine.join(peer_file_name(std::process::id() as i32));
+            for cpu in [2, 4] {
+                // Check both the first publication and an atomic replacement.
+                publish(&cfg, cpu, 1 << 30, Default::default(), Default::default());
+                let meta = std::fs::symlink_metadata(&path).unwrap();
+                assert!(meta.is_file());
+                assert_eq!(meta.uid(), current_uid());
+                assert_eq!(meta.mode() & 0o7777, 0o644);
+                assert_eq!(std::fs::metadata(&mine).unwrap().mode() & 0o7777, 0o755);
+                let peer = read_peer(&path, current_uid()).expect("the public record must parse");
+                assert_eq!(peer.cpu, cpu);
+                assert_eq!(peer.mem, 1 << 30);
+                assert_eq!(std::fs::read_dir(&mine).unwrap().count(), 1);
+            }
+            // Private replacements must still use the private writer's mode.
+            crate::job::write_atomic(&private, b"replacement", 0o600).unwrap();
+            assert_eq!(std::fs::metadata(&private).unwrap().mode() & 0o777, 0o600);
+            println!("umask 0077: peer 0644, user directory 0755, private writer 0600");
+            return;
+        }
+
+        let _lock = crate::testutil::env_lock();
+        let dir = tmpdir("restrictive-umask");
+        let output = {
+            // Set the umask before exec. The threaded test process keeps its
+            // own umask, so other tests can create files at the same time.
+            std::process::Command::new("sh")
+                .args(["-c", "umask 077; exec \"$@\"", "qex-peer-umask"])
+                .arg(std::env::current_exe().unwrap())
+                .args(["--exact", TEST, "--test-threads=1", "--nocapture"])
+                .env(CHILD_DIR, &dir)
+                .env_remove(DIR_VARIABLE)
+                .output()
+                .expect("start the isolated umask test")
+        };
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert!(
+            output.status.success(),
+            "isolated umask test failed:\n{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        print!("{}", String::from_utf8_lossy(&output.stdout));
+    }
+
+    #[test]
     fn a_record_of_this_user_does_not_count() {
         let dir = tmpdir("self");
         std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o1777)).unwrap();
@@ -471,7 +535,11 @@ mod tests {
             devices: Default::default(),
             updated_at: sys::now_secs(),
         };
-        std::fs::write(other.join("peer.json"), serde_json::to_vec(&peer).unwrap()).unwrap();
+        std::fs::write(
+            other.join("peer-1.json"),
+            serde_json::to_vec(&peer).unwrap(),
+        )
+        .unwrap();
 
         let cfg = cfg_for(&dir);
         assert_eq!(
