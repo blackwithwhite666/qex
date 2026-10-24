@@ -17,6 +17,68 @@ pub fn schema(which: &str) -> Option<&'static str> {
 
 pub const NAMES: &[&str] = &["job", "status", "pipeline", "event"];
 
+/// Describe the built Clap tree, including inherited options and arity.
+/// Only published schemas appear here; an empty list promises no schema.
+pub fn describe() -> serde_json::Value {
+    use clap::CommandFactory;
+    fn describe_command(command: &clap::Command) -> serde_json::Value {
+        let args: Vec<_> = command.get_arguments().filter(|a| !a.is_hide_set()).map(|arg| {
+            let range = arg.get_num_args().unwrap_or_default();
+            serde_json::json!({
+                "id": arg.get_id().as_str(),
+                "long": arg.get_long(),
+                "short": arg.get_short(),
+                "aliases": arg.get_all_aliases().unwrap_or_default(),
+                "positional": arg.is_positional(),
+                "required": arg.is_required_set(),
+                "global": arg.is_global_set(),
+                "action": format!("{:?}", arg.get_action()),
+                "value_names": arg.get_value_names().unwrap_or_default().iter().map(|v| v.as_str()).collect::<Vec<_>>(),
+                "min_values": range.min_values(),
+                "max_values": (range.max_values() != usize::MAX).then_some(range.max_values()),
+                "repeatable": matches!(arg.get_action(), clap::ArgAction::Append | clap::ArgAction::Count),
+                "value_delimiter": arg.get_value_delimiter(),
+                "possible_values": arg.get_value_parser().possible_values().map(|values| values.filter(|v| !v.is_hide_set()).map(|v| v.get_name().to_string()).collect::<Vec<_>>()).unwrap_or_default(),
+                "default_values": arg.get_default_values().iter().map(|v| v.to_string_lossy()).collect::<Vec<_>>(),
+                "conflicts": command.get_arg_conflicts_with(arg).iter().map(|a| a.get_id().as_str()).collect::<Vec<_>>(),
+                "help": arg.get_long_help().or(arg.get_help()).map(|v| v.to_string()),
+            })
+        }).collect();
+        let outputs = match command.get_name() {
+            "status" => {
+                serde_json::json!([{"when": "--json for one job", "schema": "status", "shape": "object"}, {"when": "--json for a group", "schema": "status", "shape": "array"}])
+            }
+            "submit" => {
+                serde_json::json!([{"when": "--wait --json", "schema": "status", "shape": "object"}])
+            }
+            "list" => serde_json::json!([{"when": "--json", "schema": "status", "shape": "array"}]),
+            "wait" => serde_json::json!([{"when": "--json", "schema": "status", "shape": "array"}]),
+            "events" => {
+                serde_json::json!([{"when": "--json", "schema": "event", "shape": "json-lines"}])
+            }
+            _ => serde_json::json!([]),
+        };
+        serde_json::json!({
+            "name": command.get_name(),
+            "aliases": command.get_all_aliases().collect::<Vec<_>>(),
+            "about": command.get_about().map(|v| v.to_string()),
+            "arguments": args,
+            "output_schemas": outputs,
+            "commands": command.get_subcommands().filter(|c| !c.is_hide_set()).map(describe_command).collect::<Vec<_>>(),
+        })
+    }
+    let mut command = crate::cli::Cli::command();
+    command.build();
+    serde_json::json!({
+        "version": crate::version::VERSION,
+        "cli": describe_command(&command),
+        "schemas": NAMES,
+        "schema_help": "Run qex schema NAME. Output schemas describe only the listed modes; other output has no published schema.",
+        "protocol_capabilities": crate::capabilities::ALL,
+        "protocol_help": "Protocol capabilities are coordinator features, not CLI command names.",
+    })
+}
+
 pub const JOB: &str = r##"{
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://github.com/qex/schema/job.json",

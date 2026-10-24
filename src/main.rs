@@ -233,6 +233,7 @@ const SPEAKS_FOR_ITSELF: &[&str] = &[
     "resume",
     "config",
     "schema",
+    "describe",
     "help",
     "version",
     "watchers",
@@ -250,10 +251,7 @@ const SPEAKS_FOR_ITSELF: &[&str] = &[
 /// taken from the arguments themselves.
 #[cfg(unix)]
 fn subcommand_word() -> String {
-    std::env::args()
-        .skip(1)
-        .find(|a| !a.starts_with('-'))
-        .unwrap_or_default()
+    cli::subcommand_in(std::env::args().skip(1))
 }
 
 #[cfg(unix)]
@@ -266,7 +264,8 @@ fn run() -> Result<i32> {
     // that reading is both plausible and wrong.
     let cli = match Cli::try_parse() {
         Ok(cli) => cli,
-        Err(e) => {
+        Err(mut e) => {
+            cli::explain_parse_error(&mut e, &subcommand_word());
             // clap chooses the stream: the help text and the version go to
             // stdout, and an error goes to stderr.
             e.print().ok();
@@ -281,6 +280,10 @@ fn run() -> Result<i32> {
         }
     };
 
+    if let Some(limit) = cli.rpc_timeout {
+        client::set_rpc_timeout(limit);
+    }
+
     let Some(command) = cli.command else {
         // `qex` without a command writes the help text. This is not an error.
         // An agent that runs `qex` to learn the tool must get the text, and the
@@ -292,6 +295,20 @@ fn run() -> Result<i32> {
     match command {
         Command::Help(args) => cmd_help(args.topic.as_deref()),
         Command::Schema(args) => cmd_schema(args.which.as_deref()),
+        Command::Describe(args) => {
+            let description = schema::describe();
+            if args.json {
+                println!("{}", serde_json::to_string_pretty(&description)?);
+            } else {
+                print_root_help();
+                println!("\nUse `qex describe --json` for argument shapes and output schemas.");
+                println!(
+                    "Protocol capabilities (these are not CLI commands): {}",
+                    capabilities::ALL.join(", ")
+                );
+            }
+            Ok(0)
+        }
         Command::Config(args) => cmd_config(args),
         Command::Submit(args) => commands::submit(args),
         Command::Run(args) => commands::run(args),

@@ -21,6 +21,12 @@ use std::path::PathBuf;
     arg_required_else_help = false
 )]
 pub struct Cli {
+    /// Limit each coordinator operation. Job waits keep their own limit.
+    ///
+    /// The default is 5m. Use a positive time such as 10s.
+    #[arg(long, global = true, value_name = "TIME", value_parser = parse_rpc_timeout)]
+    pub rpc_timeout: Option<std::time::Duration>,
+
     #[command(subcommand)]
     pub command: Option<Command>,
 }
@@ -122,6 +128,9 @@ pub enum Command {
 
     /// Write the JSON Schema of a qex format: job, status, pipeline or event.
     Schema(SchemaArgs),
+
+    /// Show the real commands, arguments and published output schemas. Works offline.
+    Describe(DescribeArgs),
 
     /// Explain a topic. Agents: run `qex help agents` first.
     Help(HelpArgs),
@@ -236,7 +245,7 @@ pub struct SubmitArgs {
     pub priority: Option<i32>,
 
     /// Stop the job after this time. Example: 4h. Use 0 for no limit.
-    #[arg(long, value_name = "TIME")]
+    #[arg(long, visible_alias = "job-timeout", value_name = "TIME")]
     pub timeout: Option<String>,
 
     /// Give up if the job waits this long in the queue. Example: 30m.
@@ -244,7 +253,7 @@ pub struct SubmitArgs {
     /// The job does not start, and its state becomes `expired`. Use 0 for no
     /// limit. The time counts from the submission, and `--timeout` limits the
     /// run of the job instead.
-    #[arg(long, value_name = "TIME")]
+    #[arg(long, visible_alias = "queue-timeout", value_name = "TIME")]
     pub max_queue_time: Option<String>,
 
     /// Wait for these jobs, and stop if one of them does not succeed.
@@ -517,7 +526,7 @@ pub struct StatusArgs {
     /// Stop the wait after this time. The job continues. Example: 30m.
     ///
     /// This option limits `--wait`, `--follow` and `--quiet --wait`.
-    #[arg(long, value_name = "TIME")]
+    #[arg(long, visible_alias = "wait-timeout", value_name = "TIME")]
     pub timeout: Option<String>,
 
     #[command(flatten)]
@@ -531,7 +540,7 @@ pub struct WaitArgs {
     pub ids: Vec<String>,
 
     /// Stop the wait after this time. The job continues. Example: 30m.
-    #[arg(long, value_name = "TIME")]
+    #[arg(long, visible_alias = "wait-timeout", value_name = "TIME")]
     pub timeout: Option<String>,
 
     /// Give control back when the NEXT job stops, and not when all stop.
@@ -764,7 +773,7 @@ pub struct EventsArgs {
     /// Stop the stream after this time. Example: 30m.
     ///
     /// The exit code is then 124, as for `qex wait`.
-    #[arg(long, value_name = "TIME")]
+    #[arg(long, visible_alias = "wait-timeout", value_name = "TIME")]
     pub timeout: Option<String>,
 }
 
@@ -943,6 +952,10 @@ pub struct WatchersArgs {
 
 #[derive(Debug, Args)]
 pub struct VersionArgs {
+    /// Show only this client's version. Do not contact the coordinator.
+    #[arg(long, conflicts_with = "check")]
+    pub client: bool,
+
     /// Ask whether a newer release of qex exists.
     ///
     /// This command reads. It never installs anything, and it never changes
@@ -957,6 +970,88 @@ pub struct VersionArgs {
     /// Write the output as JSON.
     #[arg(long)]
     pub json: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct DescribeArgs {
+    /// Write the command description as JSON.
+    #[arg(long)]
+    pub json: bool,
+}
+
+fn parse_rpc_timeout(text: &str) -> Result<std::time::Duration, String> {
+    // Bound the input before the shared parser converts a float to Duration.
+    let number = text
+        .trim()
+        .split(|c: char| !c.is_ascii_digit() && c != '.')
+        .next()
+        .unwrap_or("");
+    let value = number
+        .parse::<f64>()
+        .map_err(|_| "use a positive RPC time, such as 10s")?;
+    if !value.is_finite() || value <= 0.0 || value > 86400.0 {
+        return Err("use a positive RPC time of at most one day, such as 10s".into());
+    }
+    let time = crate::units::parse_duration(text)?.ok_or("use a positive RPC time, such as 10s")?;
+    if time.is_zero() || time > std::time::Duration::from_secs(86400) {
+        return Err("use an RPC time of at most one day, such as 10s".into());
+    }
+    Ok(time)
+}
+
+/// Find the command even when a root option consumes the next word.
+pub fn subcommand_in(args: impl Iterator<Item = String>) -> String {
+    use clap::CommandFactory;
+    let command = Cli::command();
+    let mut args = args;
+    while let Some(word) = args.next() {
+        if !word.starts_with('-') {
+            return word;
+        }
+        if command.get_arguments().any(|arg| {
+            arg.get_action().takes_values()
+                && arg
+                    .get_long()
+                    .is_some_and(|long| word == format!("--{long}"))
+        }) {
+            args.next();
+        }
+    }
+    String::new()
+}
+
+/// Keep Clap's validation and add a runnable example for the failed command.
+pub fn explain_parse_error(error: &mut clap::Error, command: &str) {
+    use clap::error::{ContextKind, ContextValue};
+    if !error.use_stderr() {
+        return;
+    }
+    let example = match command {
+        "submit" | "run" => {
+            format!("qex {command} --cpu 2 --mem 1GB --job-timeout 1h --queue-timeout 5m -- true")
+        }
+        "status" => "qex status JOB_ID --wait --wait-timeout 5m".into(),
+        "wait" => "qex wait JOB_ID --wait-timeout 5m".into(),
+        "events" => "qex events --wait-timeout 5m".into(),
+        "pipeline" => "qex pipeline ci.toml".into(),
+        "rerun" => "qex rerun JOB_ID".into(),
+        "list" => "qex list --json".into(),
+        "logs" => "qex logs JOB_ID --tail 20".into(),
+        "version" => "qex version --client --json".into(),
+        _ => "qex describe --json".into(),
+    };
+    if matches!(error.get(ContextKind::InvalidArg), Some(ContextValue::String(arg)) if arg.starts_with("--queue-timeout"))
+    {
+        error.remove(ContextKind::SuggestedArg);
+        error.remove(ContextKind::Suggested);
+    }
+    let tip = format!("Example: {example}. Replace JOB_ID with an exact job ID when shown. Use `qex {command} --help` for valid options.");
+    let mut tips = match error.remove(ContextKind::Suggested) {
+        Some(ContextValue::StyledStrs(tips)) => tips,
+        _ => Vec::new(),
+    };
+    tips.push(tip.into());
+    error.insert(ContextKind::Suggested, ContextValue::StyledStrs(tips));
 }
 
 #[derive(Debug, Args)]
@@ -1224,29 +1319,79 @@ mod tests {
         );
     }
 
-    /// `subcommand_word` in main.rs reads the first argument that does not
-    /// start with a dash. That is the subcommand ONLY while `qex` itself takes
-    /// no option with a value: `qex --config FILE submit` would otherwise give
-    /// the word `FILE`, and the exit code for a usage error would then follow
-    /// the wrong rule.
     #[test]
-    fn qex_takes_no_global_option_with_a_value() {
-        let command = crate::cli::Cli::command();
-        for arg in command.get_arguments() {
-            assert!(
-                matches!(
-                    arg.get_action(),
-                    clap::ArgAction::Help
-                        | clap::ArgAction::HelpShort
-                        | clap::ArgAction::HelpLong
-                        | clap::ArgAction::Version
-                        | clap::ArgAction::SetTrue
-                        | clap::ArgAction::SetFalse
-                ),
-                "the option `{}` takes a value, so the first word that is not an option is no \
-                 longer the subcommand. See `subcommand_word` in main.rs.",
-                arg.get_id()
+    fn root_options_keep_the_command_identity() {
+        for (args, want) in [
+            (vec!["--rpc-timeout", "1s", "list", "--bad"], "list"),
+            (vec!["--rpc-timeout=1s", "submit", "--bad"], "submit"),
+            (vec!["--version"], ""),
+        ] {
+            assert_eq!(subcommand_in(args.into_iter().map(String::from)), want);
+        }
+    }
+
+    #[test]
+    fn timeout_aliases_keep_the_legacy_fields() {
+        for command in ["submit", "run"] {
+            let cli = Cli::try_parse_from([
+                "qex",
+                command,
+                "--job-timeout",
+                "1h",
+                "--queue-timeout",
+                "5m",
+                "--wait",
+                "--wait-timeout",
+                "2m",
+                "--",
+                "true",
+            ])
+            .unwrap();
+            let args = match cli.command.unwrap() {
+                Command::Submit(args) => args,
+                Command::Run(args) => args.submit,
+                _ => unreachable!(),
+            };
+            assert_eq!(args.timeout.as_deref(), Some("1h"));
+            assert_eq!(args.max_queue_time.as_deref(), Some("5m"));
+            assert_eq!(args.wait_timeout.as_deref(), Some("2m"));
+        }
+        for args in [
+            vec!["status", "id", "--wait-timeout", "2m"],
+            vec!["wait", "id", "--wait-timeout", "2m"],
+            vec!["events", "--wait-timeout", "2m"],
+        ] {
+            let cli = Cli::try_parse_from(std::iter::once("qex").chain(args)).unwrap();
+            let timeout = match cli.command.unwrap() {
+                Command::Status(a) => a.timeout,
+                Command::Wait(a) => a.timeout,
+                Command::Events(a) => a.timeout,
+                _ => unreachable!(),
+            };
+            assert_eq!(timeout.as_deref(), Some("2m"));
+        }
+    }
+
+    #[test]
+    fn rpc_timeout_is_global_and_requires_a_positive_bounded_time() {
+        for args in [
+            vec!["qex", "--rpc-timeout", "2s", "list"],
+            vec!["qex", "list", "--rpc-timeout", "2s"],
+        ] {
+            assert_eq!(
+                Cli::try_parse_from(args).unwrap().rpc_timeout,
+                Some(std::time::Duration::from_secs(2))
             );
+        }
+        for time in [
+            "0",
+            "none",
+            "NaN",
+            "inf",
+            "1e300",
+            "999999999999999999999999999999999h",
+        ] {
+            assert!(Cli::try_parse_from(["qex", "list", "--rpc-timeout", time]).is_err());
         }
     }
 

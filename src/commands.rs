@@ -5542,6 +5542,14 @@ pub fn pipeline(args: cli::PipelineArgs) -> Result<i32> {
 /// that holds an earlier build behaves differently.
 pub fn version(args: cli::VersionArgs) -> Result<i32> {
     let mine = crate::version::VERSION;
+    if args.client {
+        if args.json {
+            println!("{}", serde_json::json!({ "version": mine }));
+        } else {
+            println!("qex {mine}");
+        }
+        return Ok(0);
+    }
 
     // `--check` asks the service NOW. It is the one path in qex that opens a
     // connection from a command of a user, and a person asked for it.
@@ -5565,18 +5573,30 @@ pub fn version(args: cli::VersionArgs) -> Result<i32> {
     // reporting "none" for a coordinator that qex could not reach would answer
     // the question wrongly and exit 0. The limit reaches the reader instead,
     // with the code that says qex stopped waiting.
-    let coordinator = match Client::connect_existing_result()? {
-        Some(mut c) => match c.call(&Request::Info) {
-            Ok(Response::Info {
-                version,
-                pid,
-                program_replaced,
-                ..
-            }) => Some((version, pid, program_replaced)),
-            Err(e) if crate::client::is_a_coordinator_timeout(&e) => return Err(e),
-            _ => None,
-        },
-        None => None,
+    let diagnostic = (|| -> Result<_> {
+        Ok(match Client::connect_existing_result()? {
+            Some(mut c) => match c.call(&Request::Info) {
+                Ok(Response::Info {
+                    version,
+                    pid,
+                    program_replaced,
+                    ..
+                }) => Some((version, pid, program_replaced)),
+                Err(e) => return Err(e),
+                other => bail!("the coordinator gave an unexpected version reply: {other:?}"),
+            },
+            None => {
+                let socket = crate::paths::socket_path()?;
+                if socket.try_exists()? {
+                    bail!("the coordinator socket {} refused the connection. Run `qex info --no-start` to check it. Read the coordinator log before starting work", socket.display());
+                }
+                None
+            }
+        })
+    })();
+    let (coordinator, failure) = match diagnostic {
+        Ok(coordinator) => (coordinator, None),
+        Err(error) => (None, Some(error)),
     };
 
     if args.json {
@@ -5596,6 +5616,15 @@ pub fn version(args: cli::VersionArgs) -> Result<i32> {
                 "coordinator": { "running": false }
             }),
         };
+        if let Some(error) = &failure {
+            value["coordinator"] = serde_json::json!({
+                "running": null,
+                "state": "unreachable",
+                "error": format!("{error:#}"),
+                "socket": crate::paths::socket_path().ok(),
+                "guidance": "Check socket access and run qex info --no-start. Use qex version --client for an offline check.",
+            });
+        }
         // `--check` ADDS to this answer, and it does not replace it. One
         // command gives one shape, so a reader that takes `coordinator` keeps
         // taking it when it asks for the check as well.
@@ -5603,6 +5632,9 @@ pub fn version(args: cli::VersionArgs) -> Result<i32> {
             value["update"] = report.json();
         }
         println!("{}", serde_json::to_string_pretty(&value)?);
+        if let Some(error) = failure {
+            return Err(error);
+        }
         return Ok(if check.as_ref().is_some_and(|r| r.error.is_some()) {
             1
         } else {
@@ -5611,7 +5643,15 @@ pub fn version(args: cli::VersionArgs) -> Result<i32> {
     }
 
     println!("qex {mine}");
-    println!("can do:      {}", crate::capabilities::ALL.join(", "));
+    println!(
+        "protocol capabilities (not CLI commands): {}",
+        crate::capabilities::ALL.join(", ")
+    );
+    if let Some(error) = failure {
+        println!("coordinator: unreachable");
+        println!("Check socket access with `qex info --no-start`. Use `qex version --client` for an offline check.");
+        return Err(error);
+    }
     match coordinator {
         None => println!("coordinator: none operates"),
         Some((version, pid, replaced)) => {
@@ -5625,7 +5665,7 @@ pub fn version(args: cli::VersionArgs) -> Result<i32> {
                     .collect();
                 if !missing.is_empty() {
                     println!(
-                        "cannot do:   {} (this coordinator is older)",
+                        "missing protocol capabilities: {} (this coordinator is older)",
                         missing.iter().map(|s| **s).collect::<Vec<_>>().join(", ")
                     );
                 }
