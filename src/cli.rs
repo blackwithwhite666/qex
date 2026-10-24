@@ -629,6 +629,20 @@ pub struct LogsArgs {
     #[arg(long, conflicts_with = "follow")]
     pub json: bool,
 
+    /// Read from the start or a returned cursor, without replaying old bytes.
+    /// Requires --json. Line selection and follow are separate modes.
+    #[arg(long, requires = "json", conflicts_with_all = ["follow", "hook", "head", "tail", "lines", "grep", "fixed", "context", "number", "max_matches", "all"])]
+    pub incremental: bool,
+
+    /// Continue an incremental read of this exact job and the same streams.
+    #[arg(long, requires = "incremental", value_name = "TOKEN")]
+    pub cursor: Option<String>,
+
+    /// Maximum encoded JSON bytes, including metadata, escaping and newline.
+    /// Incremental default: 16384. Too little room for metadata gives an error.
+    #[arg(long, requires = "incremental", value_name = "N", value_parser = clap::value_parser!(u64).range(1024..=1048576))]
+    pub max_bytes: Option<u64>,
+
     /// Show the output of the stop hook, and the verdict of qex on it.
     ///
     /// Use this option when a notification did not arrive. See `[hooks]` in
@@ -975,7 +989,7 @@ pub enum ConfigAction {
 
 #[derive(Debug, Args)]
 pub struct SchemaArgs {
-    /// The schema: job, status, pipeline, event or agent-result.
+    /// The schema: job, status, pipeline, event, agent-result or log-page.
     #[arg(value_name = "WHICH")]
     pub which: Option<String>,
 }

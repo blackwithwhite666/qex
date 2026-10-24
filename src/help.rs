@@ -1734,6 +1734,32 @@ Logs
 Every path has a limit. A search reports the number of lines that match, so a
 pattern that matches 3000 lines tells you that the pattern is too wide.
 
+Incremental JSON logs
+---------------------
+
+    qex logs <id> --json --incremental --max-bytes 16384
+    qex logs <id> --json --incremental --cursor TOKEN --max-bytes 16384
+
+This mode starts at the first retained byte. Keep the returned `cursor` and
+give it to the next read of the same job and streams. `--stdout` or `--stderr`
+selects one stream; the default reads stdout then stderr. A no-change read
+returns empty text and a reusable cursor. `has_more` refers to the retained
+snapshot, and does not say whether the job has stopped.
+
+The limit covers the complete encoded JSON, including escaping and newline.
+The default is 16384 bytes; the allowed range is 1024 to 1048576. A cap that
+cannot hold metadata or the next byte unit gives an error. Only displayed
+original bytes advance the cursor. An incomplete UTF-8 suffix waits for an
+append; `pending_utf8` says so. At job completion, invalid byte units use the
+replacement character. Read `qex schema log-page` for the fields and states.
+
+`state: loss` reports retention loss; known dropped byte and line counts are
+included. `state: error` reports invalid/foreign cursors, changed stream
+selection, missing/unreadable files, shrink, replacement or rewrite. Such a
+read advances nothing and returns a null cursor. Omit the cursor to restart
+from retained output. Line selectors, follow and hook logs are separate modes
+and cannot be combined with `--incremental`. Plain `--json` keeps its format.
+
 The output of a job also has a limit
 ------------------------------------
 

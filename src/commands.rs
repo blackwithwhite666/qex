@@ -3101,6 +3101,21 @@ pub fn logs(args: cli::LogsArgs) -> Result<i32> {
 
     let dir = paths::job_dir(&id)?;
 
+    if args.incremental {
+        let status = crate::job::read_status(&dir)
+            .context("cannot read the job record for incremental logs")?;
+        let (page, failed) = crate::logsel::incremental(
+            &dir,
+            id,
+            &chosen_streams(&args.select),
+            args.cursor.as_deref(),
+            args.max_bytes.unwrap_or(16384) as usize,
+            &status,
+        )?;
+        println!("{page}");
+        return Ok(if failed { 1 } else { 0 });
+    }
+
     if args.follow {
         // A stream has no total, so the options that count a total have no
         // meaning here.
