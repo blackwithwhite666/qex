@@ -12,11 +12,19 @@ pub fn schema(which: &str) -> Option<&'static str> {
         "pipeline" | "pipelines" | "pipeline-file" => Some(PIPELINE),
         "event" | "events" | "stream" => Some(EVENT),
         "agent-result" => Some(AGENT_RESULT),
+        "log-page" => Some(LOG_PAGE),
         _ => None,
     }
 }
 
-pub const NAMES: &[&str] = &["job", "status", "pipeline", "event", "agent-result"];
+pub const NAMES: &[&str] = &[
+    "job",
+    "status",
+    "pipeline",
+    "event",
+    "agent-result",
+    "log-page",
+];
 
 /// Describe the built Clap tree, including inherited options and arity.
 /// Only published schemas appear here; an empty list promises no schema.
@@ -58,6 +66,9 @@ pub fn describe() -> serde_json::Value {
             }
             "events" => {
                 serde_json::json!([{"when": "--json", "schema": "event", "shape": "json-lines"}])
+            }
+            "logs" => {
+                serde_json::json!([{"when":"--json --incremental", "schema":"log-page", "shape":"object"}])
             }
             _ => serde_json::json!([]),
         };
@@ -111,6 +122,45 @@ pub const AGENT_RESULT: &str = r##"{
           "logs_truncated": {"type": "boolean", "description": "The response byte budget removed some selected log text. hidden_lines reports line selection; logs_dropped from schema status reports retention loss."},
           "logs": {"type": "object", "description": "stdout/stderr objects with text and hidden_lines. Default last 20 lines of each available stream. All encoded JSON, including escaping and the final newline, fits max-bytes (default 16384)."}
         }
+      }
+    }
+  }
+}"##;
+
+pub const LOG_PAGE: &str = r##"{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "qex incremental log page v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["version", "id", "state", "streams", "cursor"],
+  "properties": {
+    "version": {"const": 1},
+    "id": {"type": "string", "format": "uuid"},
+    "state": {"enum": ["ok", "loss", "error"], "description": "Loss means retained output is incomplete. Error means continuity or reading failed; no stream advances and cursor is null."},
+    "error": {"enum": ["invalid_cursor", "foreign_cursor", "selection_changed"]},
+    "cursor": {"type": ["string", "null"], "description": "Opaque job and stream bound continuation, including on an empty read. Omit the input cursor to restart after a continuity error."},
+    "streams": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {"stdout": {"$ref": "#/$defs/stream"}, "stderr": {"$ref": "#/$defs/stream"}}
+    }
+  },
+  "$defs": {
+    "stream": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["text", "state", "start", "end", "has_more", "pending_utf8", "retention_loss", "dropped_bytes", "dropped_lines", "incomplete"],
+      "properties": {
+        "text": {"type": "string", "description": "Complete UTF-8 units from original retained bytes, without line normalization. Invalid bytes use replacement characters."},
+        "state": {"enum": ["ok", "waiting", "missing", "read_error", "changed_during_read", "replaced", "shrunk", "rewritten"]},
+        "start": {"type": "integer", "minimum": 0},
+        "end": {"type": "integer", "minimum": 0, "description": "Only displayed original bytes advance this retained-file offset."},
+        "has_more": {"type": "boolean", "description": "Retained snapshot bytes remain. False does not mean the job has finished."},
+        "pending_utf8": {"type": "boolean", "description": "An incomplete UTF-8 suffix awaits append or terminal status. The cursor has not consumed it."},
+        "retention_loss": {"type": "boolean"},
+        "dropped_bytes": {"type": "integer", "minimum": 0, "description": "Known removed original bytes. Zero does not exclude live retention loss or incomplete capture."},
+        "dropped_lines": {"type": "integer", "minimum": 0},
+        "incomplete": {"type": "boolean"}
       }
     }
   }

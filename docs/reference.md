@@ -33,7 +33,8 @@ qex pause  [queue|lock NAME] [--reason TEXT] [--for TIME] [--drain]
 qex resume [queue|lock NAME] --pause ID
 qex version [--client|--check] [--json]   client and coordinator diagnostics
 qex config show             the values that qex uses now
-qex schema job|status|pipeline|event    the JSON Schema of each format
+qex schema job|status|pipeline|event|agent-result|log-page
+                            the JSON Schema of each format
 qex describe [--json]        actual commands, arguments and output schemas
 qex completions <shell>     the completions for bash, zsh or fish
 qex help <topic>
@@ -50,6 +51,55 @@ value counts, defaults, conflicts and published output schema names. Read the
 `when` and `shape` fields of each output schema entry. Other output modes have
 no published schema. `protocol_capabilities` names coordinator features;
 `history`, `learn` and `query` in that list are not CLI commands.
+
+### Incremental logs
+
+```sh
+qex logs ID --json --incremental --stdout --max-bytes 16384
+qex logs ID --json --incremental --stdout --cursor TOKEN --max-bytes 16384
+```
+
+The first read starts at byte zero of the retained log. Pass its opaque
+`cursor` unchanged to the next read of the same job and streams. The default
+selects stdout followed by stderr. A read with no new bytes returns empty
+text and a reusable cursor. `has_more` describes the retained snapshot;
+the job can still append after it becomes false. This is a snapshot reader,
+not a wait. `qex schema log-page` describes this opt-in version 1 response.
+Plain `logs --json` and existing line selection and follow modes keep their
+formats. Incremental mode rejects all line selectors, follow and hook logs.
+
+`--max-bytes` bounds the entire encoded JSON document, including metadata,
+escaped text, the cursor and the final newline. The default is 16384; the
+range is 1024 to 1048576. Too little room for metadata or the next original
+byte unit gives an error with no partial document. The cursor advances only
+over displayed original bytes. Streams have retained-file `start` and `end`
+offsets; these count original bytes, not encoded JSON bytes. UTF-8 characters
+stay whole. An incomplete UTF-8 suffix in a live job stays unread, with
+`pending_utf8: true`. Terminal jobs show that suffix with a replacement
+character. Other invalid byte units also use replacement characters.
+
+`state: loss` and `retention_loss` say that the retained file is incomplete.
+Known `dropped_bytes` and `dropped_lines` come from the job record. While the
+job runs those counts can still be zero. `incomplete` reports capture that
+did not close. A retained-output cursor can continue while loss stays visible.
+`state: error` means no stream advances and the returned cursor is null.
+Cursor errors have `error: invalid_cursor`, `foreign_cursor` or
+`selection_changed`. File errors appear in stream `state`: `missing`,
+`read_error`, `changed_during_read`, `replaced`, `shrunk` or `rewritten`.
+Omit the input cursor to restart from retained bytes after an error.
+A missing file in a nonterminal job is `waiting` until the file appears.
+Incremental read/cursor errors exit 1; command-line conflicts exit 2.
+
+Cursors carry file identity, displayed offsets and a fingerprint of the
+whole previously observed retained prefix, including undisplayed bytes.
+Reads scan that prefix and fingerprint each file twice to detect changes during
+the read. File I/O scales with retained log size. Memory holds a fixed scan
+buffer and at most the byte cap plus three candidate bytes per stream.
+Appends preserve continuity. A truncation followed by
+identical restoration between reads cannot be distinguished from unchanged
+content. Fingerprints detect ordinary rewrites; cursors are not authenticated
+tokens and do not protect against hostile collisions or forged offsets.
+They contain no paths and create no cursor database.
 
 | Limit | Explicit name | Older name |
 | --- | --- | --- |

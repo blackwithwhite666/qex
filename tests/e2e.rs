@@ -21042,3 +21042,347 @@ fn qex_b_offline_batch_reports_corrupt_records_and_budget_errors() {
     assert!(out.stdout.is_empty(), "budget failure emitted partial JSON");
     assert!(String::from_utf8_lossy(&out.stderr).contains("too small for the selected metadata"));
 }
+
+fn c_page(
+    qex: &dyn Fn(&[&str]) -> Output,
+    id: &str,
+    cursor: Option<&str>,
+    cap: &str,
+) -> serde_json::Value {
+    let mut args = vec![
+        "logs",
+        id,
+        "--json",
+        "--incremental",
+        "--stdout",
+        "--max-bytes",
+        cap,
+    ];
+    if let Some(cursor) = cursor {
+        args.extend(["--cursor", cursor]);
+    }
+    let out = qex(&args);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(out.stdout.len() <= cap.parse::<usize>().unwrap());
+    serde_json::from_slice(&out.stdout).unwrap()
+}
+
+#[test]
+fn qex_c_incremental_live_append_no_change_and_partial_utf8() {
+    let end = Instant::now() + Duration::from_secs(45);
+    let deadline = end - 2 * STOP_LIMIT;
+    let h = Harness::with_default_config("clive");
+    let qex = |args: &[&str]| h.command_until(h.command(args), &args.join(" "), deadline);
+    let gate = h.root.join("append");
+    let id = b_submit(
+        &qex,
+        &[
+            "submit",
+            "--timeout",
+            "25s",
+            "--",
+            "sh",
+            "-c",
+            r#"printf 'first\n\342\202'; while [ ! -e "$1" ]; do sleep 0.02; done; printf '\254\nsecond\n'"#,
+            "sh",
+            gate.to_str().unwrap(),
+        ],
+    );
+    let log = h.job_dir(&id).join("stdout.log");
+    while std::fs::read(&log).unwrap_or_default() != b"first\n\xe2\x82" {
+        assert!(
+            Instant::now() < deadline,
+            "job did not write its first bytes"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let first = c_page(&qex, &id, None, "2048");
+    assert_eq!(first["streams"]["stdout"]["text"], "first\n");
+    assert_eq!(first["streams"]["stdout"]["end"], 6);
+    assert_eq!(first["streams"]["stdout"]["pending_utf8"], true);
+    let cursor = first["cursor"].as_str().unwrap();
+    let unchanged = c_page(&qex, &id, Some(cursor), "2048");
+    assert_eq!(unchanged["streams"]["stdout"]["text"], "");
+    assert_eq!(unchanged["cursor"], first["cursor"]);
+    std::fs::write(gate, "go").unwrap();
+    b_ok(&qex, &["wait", &id, "--timeout", "20s"]);
+    let next = c_page(&qex, &id, Some(cursor), "2048");
+    assert_eq!(next["streams"]["stdout"]["text"], "€\nsecond\n");
+    assert_eq!(next["streams"]["stdout"]["pending_utf8"], false);
+    let last = c_page(&qex, &id, next["cursor"].as_str(), "2048");
+    assert_eq!(last["streams"]["stdout"]["text"], "");
+    assert_eq!(last["cursor"], next["cursor"]);
+    drop(h);
+    assert!(Instant::now() < end);
+}
+
+#[test]
+fn qex_c_encoded_caps_never_skip_original_bytes() {
+    let end = Instant::now() + Duration::from_secs(60);
+    let deadline = end - 2 * STOP_LIMIT;
+    let h = Harness::with_default_config("ccap");
+    let qex = |args: &[&str]| h.command_until(h.command(args), &args.join(" "), deadline);
+    let mut raw = "\"\\\n\t\0€😀".repeat(100).into_bytes();
+    raw.extend([0xff, 0xe2, 0x82]);
+    let source = h.root.join("bytes");
+    std::fs::write(&source, &raw).unwrap();
+    let id = b_submit(
+        &qex,
+        &[
+            "submit",
+            "--",
+            "sh",
+            "-c",
+            r#"cat "$1"; cat "$1" >&2"#,
+            "sh",
+            source.to_str().unwrap(),
+        ],
+    );
+    b_ok(&qex, &["wait", &id, "--timeout", "20s"]);
+    for cap in ["1024", "1031", "2048"] {
+        let mut cursor = None;
+        let mut text = String::new();
+        let mut offset = 0;
+        for _ in 0..100 {
+            let page = c_page(&qex, &id, cursor.as_deref(), cap);
+            let s = &page["streams"]["stdout"];
+            assert_eq!(page["state"], "ok");
+            assert_eq!(s["start"], offset);
+            text.push_str(s["text"].as_str().unwrap());
+            offset = s["end"].as_u64().unwrap();
+            cursor = Some(page["cursor"].as_str().unwrap().to_string());
+            if s["has_more"] == false {
+                break;
+            }
+            assert!(!s["text"].as_str().unwrap().is_empty());
+        }
+        assert_eq!(text, String::from_utf8_lossy(&raw));
+        assert_eq!(offset, raw.len() as u64);
+        let empty = c_page(&qex, &id, cursor.as_deref(), cap);
+        assert_eq!(empty["cursor"].as_str(), cursor.as_deref());
+        assert_eq!(empty["streams"]["stdout"]["text"], "");
+    }
+    let both = qex(&[
+        "logs",
+        &id,
+        "--json",
+        "--incremental",
+        "--max-bytes",
+        "4096",
+    ]);
+    assert!(both.status.success());
+    let mut both: serde_json::Value = serde_json::from_slice(&both.stdout).unwrap();
+    let mut stdout = String::new();
+    let mut stderr = String::new();
+    for _ in 0..100 {
+        stdout.push_str(both["streams"]["stdout"]["text"].as_str().unwrap());
+        stderr.push_str(both["streams"]["stderr"]["text"].as_str().unwrap());
+        if both["streams"]["stdout"]["has_more"] == false
+            && both["streams"]["stderr"]["has_more"] == false
+        {
+            break;
+        }
+        let out = qex(&[
+            "logs",
+            &id,
+            "--json",
+            "--incremental",
+            "--cursor",
+            both["cursor"].as_str().unwrap(),
+            "--max-bytes",
+            "4096",
+        ]);
+        assert!(out.status.success());
+        assert!(out.stdout.len() <= 4096);
+        both = serde_json::from_slice(&out.stdout).unwrap();
+    }
+    assert_eq!(stdout, String::from_utf8_lossy(&raw));
+    assert_eq!(stderr, stdout);
+    drop(h);
+    assert!(Instant::now() < end);
+}
+
+#[test]
+fn qex_c_cursor_faults_and_selection_conflicts_are_explicit() {
+    let end = Instant::now() + Duration::from_secs(60);
+    let deadline = end - 2 * STOP_LIMIT;
+    let h = Harness::with_default_config("cfault");
+    let qex = |args: &[&str]| h.command_until(h.command(args), &args.join(" "), deadline);
+    for extra in [
+        vec!["--tail", "2"],
+        vec!["--head", "1"],
+        vec!["--lines", "1:2"],
+        vec!["--grep", "x"],
+        vec!["--fixed"],
+        vec!["--context", "1"],
+        vec!["--number"],
+        vec!["--all"],
+        vec!["--max-matches", "1"],
+        vec!["--follow"],
+        vec!["--hook"],
+    ] {
+        let mut args = vec!["logs", "absent", "--json", "--incremental"];
+        args.extend(extra);
+        let out = qex(&args);
+        assert_eq!(out.status.code(), Some(2), "{args:?}");
+    }
+    for extra in [
+        vec!["--incremental"],
+        vec!["--json", "--cursor", "bad"],
+        vec!["--json", "--max-bytes", "1024"],
+    ] {
+        let mut args = vec!["logs", "absent"];
+        args.extend(extra);
+        assert_eq!(qex(&args).status.code(), Some(2));
+    }
+    let id = b_submit(&qex, &["submit", "--", "true"]);
+    let other = b_submit(&qex, &["submit", "--", "true"]);
+    b_ok(&qex, &["wait", &id, &other, "--timeout", "20s"]);
+    let path = h.job_dir(&id).join("stdout.log");
+    let original = vec![b'a'; 5000];
+    std::fs::write(&path, &original).unwrap();
+    let first = c_page(&qex, &id, None, "1024");
+    assert_eq!(first["streams"]["stdout"]["has_more"], true);
+    let cursor = first["cursor"].as_str().unwrap();
+    for (target, stream, token, expected) in [
+        (id.as_str(), "--stdout", "bad", "invalid_cursor"),
+        (other.as_str(), "--stdout", cursor, "foreign_cursor"),
+        (id.as_str(), "--stderr", cursor, "selection_changed"),
+    ] {
+        let out = qex(&[
+            "logs",
+            target,
+            "--json",
+            "--incremental",
+            stream,
+            "--cursor",
+            token,
+        ]);
+        assert_eq!(out.status.code(), Some(1));
+        let value: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+        assert_eq!(value["error"], expected);
+        assert!(value["cursor"].is_null());
+    }
+    for change in ["rewritten", "shrunk", "replaced", "missing", "read_error"] {
+        std::fs::write(&path, &original).unwrap();
+        let fresh = c_page(&qex, &id, None, "1024");
+        match change {
+            "rewritten" => {
+                let mut changed = original.clone();
+                changed[4999] = b'z'; // Beyond the bytes displayed by the first page.
+                std::fs::write(&path, changed).unwrap();
+            }
+            "shrunk" => std::fs::write(&path, b"a").unwrap(),
+            "replaced" => {
+                let replacement = path.with_extension("replacement");
+                std::fs::write(&replacement, &original).unwrap();
+                std::fs::rename(replacement, &path).unwrap();
+            }
+            "missing" => std::fs::remove_file(&path).unwrap(),
+            "read_error" => {
+                std::fs::remove_file(&path).unwrap();
+                std::fs::create_dir(&path).unwrap();
+            }
+            _ => unreachable!(),
+        }
+        let out = qex(&[
+            "logs",
+            &id,
+            "--json",
+            "--incremental",
+            "--stdout",
+            "--cursor",
+            fresh["cursor"].as_str().unwrap(),
+        ]);
+        assert_eq!(out.status.code(), Some(1), "{change}");
+        let value: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+        assert_eq!(value["streams"]["stdout"]["state"], change);
+        assert_eq!(value["streams"]["stdout"]["text"], "");
+        assert_eq!(
+            value["streams"]["stdout"]["start"],
+            value["streams"]["stdout"]["end"]
+        );
+        assert!(value["cursor"].is_null());
+        if change == "read_error" {
+            std::fs::remove_dir(&path).unwrap();
+        }
+    }
+    drop(h);
+    assert!(Instant::now() < end);
+}
+
+#[test]
+fn qex_c_live_retention_loss_and_queued_empty_cursor() {
+    let end = Instant::now() + Duration::from_secs(60);
+    let deadline = end - 2 * STOP_LIMIT;
+    let h = Harness::new("closs", "[peers]\nenabled = false\n[system]\nreserve_mem = \"0\"\nmax_pressure = 100\n[logs]\nmax_bytes = \"16KB\"\n");
+    let qex = |args: &[&str]| h.command_until(h.command(args), &args.join(" "), deadline);
+    let pause: serde_json::Value =
+        serde_json::from_str(&b_ok(&qex, &["pause", "queue", "--json"])).unwrap();
+    let gate = h.root.join("finish");
+    let id = b_submit(&qex, &["submit", "--timeout", "30s", "--", "sh", "-c",
+        "i=0; while [ $i -lt 5000 ]; do printf 'line-%s-abcdefghijklmnop\n' \"$i\"; i=$((i+1)); done; while [ ! -e \"$1\" ]; do sleep 0.02; done",
+        "sh", gate.to_str().unwrap()]);
+    let queued = c_page(&qex, &id, None, "2048");
+    assert_eq!(queued["streams"]["stdout"]["state"], "waiting");
+    let again = c_page(&qex, &id, queued["cursor"].as_str(), "2048");
+    assert_eq!(again["cursor"], queued["cursor"]);
+    b_ok(
+        &qex,
+        &[
+            "resume",
+            "queue",
+            "--pause",
+            pause["pause_id"].as_str().unwrap(),
+        ],
+    );
+    let path = h.job_dir(&id).join("stdout.log");
+    while !path.with_extension("log.tail").exists() {
+        assert!(Instant::now() < deadline, "retention did not start");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let live = c_page(&qex, &id, queued["cursor"].as_str(), "2048");
+    assert_eq!(live["state"], "loss");
+    assert_eq!(live["streams"]["stdout"]["retention_loss"], true);
+    std::fs::write(gate, "go").unwrap();
+    b_ok(&qex, &["wait", &id, "--timeout", "20s"]);
+    let continued = qex(&[
+        "logs",
+        &id,
+        "--json",
+        "--incremental",
+        "--stdout",
+        "--cursor",
+        live["cursor"].as_str().unwrap(),
+    ]);
+    assert!(continued.status.success());
+    let continued: serde_json::Value = serde_json::from_slice(&continued.stdout).unwrap();
+    assert_eq!(continued["state"], "loss");
+    let stream = &continued["streams"]["stdout"];
+    assert_eq!(stream["state"], "ok");
+    assert_eq!(stream["start"], live["streams"]["stdout"]["end"]);
+    assert!(stream["dropped_bytes"].as_u64().unwrap() > 0);
+    let retained = std::fs::read(&path).unwrap();
+    let from = stream["start"].as_u64().unwrap() as usize;
+    let to = stream["end"].as_u64().unwrap() as usize;
+    assert_eq!(
+        stream["text"].as_str().unwrap(),
+        String::from_utf8_lossy(&retained[from..to]).as_ref()
+    );
+    assert!(continued["cursor"].is_string());
+    let final_page = c_page(&qex, &id, None, "2048");
+    assert_eq!(final_page["state"], "loss");
+    assert!(
+        final_page["streams"]["stdout"]["dropped_bytes"]
+            .as_u64()
+            .unwrap()
+            > 0
+    );
+    assert!(!path.with_extension("log.tail").exists());
+    drop(h);
+    assert!(Instant::now() < end);
+}

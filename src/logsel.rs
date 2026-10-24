@@ -547,9 +547,460 @@ fn match_one(token: &Token, chars: &[char], position: usize) -> Option<usize> {
     ok.then_some(position + 1)
 }
 
+// The cursor is an observation of retained files, not an authorization token.
+// Keep its encoding private and versioned. No paths come from this data.
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LogCursor {
+    v: u8,
+    j: uuid::Uuid,
+    s: Vec<LogPosition>,
+}
+
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LogPosition {
+    n: String,
+    // Device, inode, observed length and fingerprint of that entire prefix.
+    // Include undisplayed bytes: rewriting those must invalidate the cursor too.
+    m: Option<(u64, u64, u64, u64)>,
+    o: u64,
+}
+
+impl LogCursor {
+    fn encode(&self) -> String {
+        let mut out = String::from("qlog1-");
+        for b in serde_json::to_vec(self).expect("a log cursor serializes") {
+            use std::fmt::Write;
+            write!(out, "{b:02x}").unwrap();
+        }
+        out
+    }
+
+    fn decode(raw: &str) -> Option<Self> {
+        let hex = raw.strip_prefix("qlog1-")?;
+        if hex.len() > 4096 || hex.len() % 2 != 0 {
+            return None;
+        }
+        let bytes: Option<Vec<u8>> = hex
+            .as_bytes()
+            .chunks_exact(2)
+            .map(|pair| {
+                let digit = |c: u8| (c as char).to_digit(16).map(|n| n as u8);
+                Some(digit(pair[0])? * 16 + digit(pair[1])?)
+            })
+            .collect();
+        let cursor: Self = serde_json::from_slice(&bytes?).ok()?;
+        (cursor.v == 1
+            && cursor.s.len() <= 2
+            && cursor
+                .s
+                .iter()
+                .all(|p| p.m.map_or(p.o == 0, |(_, _, len, _)| p.o <= len)))
+        .then_some(cursor)
+    }
+}
+
+fn log_fingerprint(seed: u64, bytes: &[u8]) -> u64 {
+    // FNV-1a, as used for other local fingerprints in qex. This detects
+    // ordinary file changes; it is not a defense against hostile collisions.
+    bytes.iter().fold(seed, |hash, b| {
+        (hash ^ *b as u64).wrapping_mul(0x100000001b3)
+    })
+}
+
+/// Scan a fixed retained prefix with constant scratch space, keeping only the
+/// page candidate. Fingerprint the old observed prefix separately so rewriting
+/// even an undisplayed byte invalidates the continuation.
+fn scan_log(
+    file: &mut std::fs::File,
+    len: u64,
+    previous_len: u64,
+    offset: u64,
+    window: usize,
+) -> std::io::Result<(u64, u64, Vec<u8>, bool)> {
+    use std::io::Read;
+    let mut buffer = [0u8; 65536 + 64];
+    let (mut hash, mut previous_hash) = (0xcbf29ce484222325, 0xcbf29ce484222325);
+    let (mut read, mut carry) = (0u64, 0usize);
+    let mut bytes = Vec::new();
+    let mut loss = false;
+    while read < len {
+        let n = (len - read).min(65536) as usize;
+        file.read_exact(&mut buffer[carry..carry + n])?;
+        let data = &buffer[carry..carry + n];
+        hash = log_fingerprint(hash, data);
+        let old_n = previous_len.saturating_sub(read).min(n as u64) as usize;
+        previous_hash = log_fingerprint(previous_hash, &data[..old_n]);
+        let from = read.max(offset);
+        let to = (read + n as u64).min(offset.saturating_add(window as u64));
+        if from < to {
+            bytes.extend_from_slice(&data[(from - read) as usize..(to - read) as usize]);
+        }
+        let scanned = &buffer[..carry + n];
+        loss |= [
+            b"[qex] The output of this job reached the limit".as_slice(),
+            b"[qex] ----".as_slice(),
+        ]
+        .iter()
+        .any(|note| scanned.windows(note.len()).any(|w| w == *note));
+        read += n as u64;
+        let end = carry + n;
+        carry = end.min(64);
+        buffer.copy_within(end - carry..end, 0);
+    }
+    Ok((hash, previous_hash, bytes, loss))
+}
+
+struct LogSnapshot {
+    position: LogPosition,
+    bytes: Vec<u8>,
+    state: &'static str,
+    retention_loss: bool,
+    dropped_bytes: u64,
+    dropped_lines: u64,
+    incomplete: bool,
+}
+
+fn log_snapshot(
+    dir: &std::path::Path,
+    name: &str,
+    file: &str,
+    old: Option<&LogPosition>,
+    status: &crate::job::JobStatus,
+    window: usize,
+) -> LogSnapshot {
+    use std::io::{Seek, SeekFrom};
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+    let path = dir.join(file);
+    let dropped = status
+        .logs_dropped
+        .and_then(|d| d.of(name))
+        .unwrap_or_default();
+    let incomplete = status.logs_dropped.is_some_and(|d| d.incomplete);
+    let mut snapshot = LogSnapshot {
+        position: LogPosition {
+            n: name.into(),
+            m: None,
+            o: old.map_or(0, |p| p.o),
+        },
+        bytes: Vec::new(),
+        state: "ok",
+        retention_loss: dropped.0 > 0 || incomplete || crate::logcap::tail_path(&path).exists(),
+        dropped_bytes: dropped.0,
+        dropped_lines: dropped.1,
+        incomplete,
+    };
+    let read = (|| -> std::io::Result<_> {
+        // A directory or FIFO is a read fault, never empty output or a blocking read.
+        let mut f = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NONBLOCK)
+            .open(&path)?;
+        let before = f.metadata()?;
+        if !before.is_file() {
+            return Err(std::io::Error::other("not a regular log file"));
+        }
+        let old_len = old.and_then(|p| p.m).map_or(0, |m| m.2);
+        let (hash, previous_hash, bytes, loss) =
+            scan_log(&mut f, before.len(), old_len, snapshot.position.o, window)?;
+        // Check the same prefix twice. Concurrent appends are allowed; a
+        // retention rewrite during the read is an explicit unstable snapshot.
+        f.seek(SeekFrom::Start(0))?;
+        let (check, _, _, _) = scan_log(&mut f, before.len(), 0, 0, 0)?;
+        let after = std::fs::metadata(&path)?;
+        let stable = hash == check
+            && before.dev() == after.dev()
+            && before.ino() == after.ino()
+            && after.len() >= before.len();
+        Ok((before, bytes, hash, previous_hash, loss, stable))
+    })();
+    match read {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            snapshot.state = if old.is_some_and(|p| p.m.is_some()) || status.state.is_terminal() {
+                "missing"
+            } else {
+                "waiting"
+            };
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
+            snapshot.state = "changed_during_read"
+        }
+        Err(_) => snapshot.state = "read_error",
+        Ok((metadata, bytes, hash, previous_hash, loss, stable)) => {
+            let mark = (metadata.dev(), metadata.ino(), metadata.len(), hash);
+            snapshot.position.m = Some(mark);
+            snapshot.retention_loss |= loss;
+            snapshot.state = if !stable {
+                "changed_during_read"
+            } else if let Some((dev, ino, len, hash)) = old.and_then(|p| p.m) {
+                if dev != mark.0 || ino != mark.1 {
+                    "replaced"
+                } else if mark.2 < len {
+                    "shrunk"
+                } else if previous_hash != hash {
+                    "rewritten"
+                } else {
+                    "ok"
+                }
+            } else {
+                "ok"
+            };
+            snapshot.bytes = bytes;
+        }
+    }
+    snapshot
+}
+
+/// Convert only complete original byte units that fit. An incomplete UTF-8
+/// suffix waits for a later append, except in a terminal job. Invalid units
+/// use the same replacement character as the legacy log reader.
+fn log_prefix(bytes: &[u8], limit: usize, terminal: bool) -> (String, usize) {
+    let mut text = String::new();
+    let mut used = 0;
+    while used < bytes.len() && used < limit {
+        let (valid, invalid) = match std::str::from_utf8(&bytes[used..]) {
+            Ok(s) => (s, None),
+            Err(e) => (
+                std::str::from_utf8(&bytes[used..used + e.valid_up_to()]).unwrap(),
+                Some(e),
+            ),
+        };
+        let mut take = valid.len().min(limit - used);
+        while !valid.is_char_boundary(take) {
+            take -= 1;
+        }
+        text.push_str(&valid[..take]);
+        used += take;
+        if take < valid.len() {
+            break;
+        }
+        let Some(error) = invalid else { break };
+        let bad = match error.error_len() {
+            Some(n) => n,
+            None if terminal => bytes.len() - used,
+            None => break,
+        };
+        if bad > limit - used {
+            break;
+        }
+        text.push('\u{fffd}');
+        used += bad;
+    }
+    (text, used)
+}
+
+/// Opt-in bounded incremental JSON. Legacy line selectors use `apply` above.
+pub fn incremental(
+    dir: &std::path::Path,
+    id: uuid::Uuid,
+    streams: &[(&str, &str)],
+    raw_cursor: Option<&str>,
+    cap: usize,
+    status: &crate::job::JobStatus,
+) -> anyhow::Result<(String, bool)> {
+    use serde_json::json;
+    let old = raw_cursor.and_then(LogCursor::decode);
+    let error = if raw_cursor.is_some() && old.is_none() {
+        Some("invalid_cursor")
+    } else if old.as_ref().is_some_and(|c| c.j != id) {
+        Some("foreign_cursor")
+    } else if old.as_ref().is_some_and(|c| {
+        c.s.iter()
+            .map(|p| p.n.as_str())
+            .ne(streams.iter().map(|s| s.0))
+    }) {
+        Some("selection_changed")
+    } else {
+        None
+    };
+    if let Some(error) = error {
+        let page =
+            json!({"version":1,"id":id,"state":"error","error":error,"streams":{},"cursor":null});
+        return Ok((serde_json::to_string(&page)?, true));
+    }
+    let snapshots: Vec<_> = streams
+        .iter()
+        .enumerate()
+        .map(|(i, (name, file))| {
+            log_snapshot(
+                dir,
+                name,
+                file,
+                old.as_ref().map(|c| &c.s[i]),
+                status,
+                cap.saturating_add(3),
+            )
+        })
+        .collect();
+    let failed = snapshots
+        .iter()
+        .any(|s| !matches!(s.state, "ok" | "waiting"));
+    let loss = snapshots.iter().any(|s| s.retention_loss);
+    let render = |mut take: usize| -> anyhow::Result<String> {
+        let mut next = LogCursor {
+            v: 1,
+            j: id,
+            s: Vec::new(),
+        };
+        let mut output = serde_json::Map::new();
+        for snapshot in &snapshots {
+            let mut p = snapshot.position.clone();
+            let (text, used) = if failed {
+                (String::new(), 0)
+            } else {
+                log_prefix(
+                    &snapshot.bytes,
+                    take,
+                    status.state.is_terminal()
+                        && snapshot
+                            .position
+                            .m
+                            .is_some_and(|m| m.2 - p.o == snapshot.bytes.len() as u64),
+                )
+            };
+            let start = p.o;
+            p.o += used as u64;
+            take -= used;
+            let remaining = &snapshot.bytes[used..];
+            let has_more = snapshot.position.m.is_some_and(|m| m.2 > p.o);
+            let pending_utf8 = !status.state.is_terminal()
+                && !remaining.is_empty()
+                && snapshot
+                    .position
+                    .m
+                    .is_some_and(|m| m.2 - p.o == remaining.len() as u64)
+                && std::str::from_utf8(remaining)
+                    .is_err_and(|e| e.valid_up_to() == 0 && e.error_len().is_none());
+            output.insert(p.n.clone(), json!({
+                "text":text, "state":snapshot.state, "start":start, "end":p.o,
+                "has_more":has_more, "pending_utf8":pending_utf8,
+                "retention_loss":snapshot.retention_loss, "dropped_bytes":snapshot.dropped_bytes,
+                "dropped_lines":snapshot.dropped_lines, "incomplete":snapshot.incomplete,
+            }));
+            next.s.push(p);
+        }
+        Ok(serde_json::to_string(&json!({
+            "version":1, "id":id, "state":if failed { "error" } else if loss { "loss" } else { "ok" },
+            "streams":output, "cursor":if failed { None } else { Some(next.encode()) },
+        }))?)
+    };
+    if render(0)?.len() + 1 > cap {
+        anyhow::bail!("--max-bytes {cap} cannot hold incremental log metadata; increase the cap");
+    }
+    let (mut lo, mut hi) = (0, cap);
+    while lo < hi {
+        let mid = lo + (hi - lo).div_ceil(2);
+        if render(mid)?.len() < cap {
+            lo = mid;
+        } else {
+            hi = mid - 1;
+        }
+    }
+    let page = render(lo)?;
+    // A tiny cap must not trap the caller at a reusable but immobile cursor.
+    if !failed
+        && snapshots
+            .iter()
+            .any(|s| s.position.m.is_some_and(|m| m.2 > s.position.o))
+    {
+        let result: serde_json::Value = serde_json::from_str(&page)?;
+        let advanced = result["streams"]
+            .as_object()
+            .unwrap()
+            .values()
+            .any(|s| s["start"] != s["end"]);
+        let pending = result["streams"]
+            .as_object()
+            .unwrap()
+            .values()
+            .any(|s| s["pending_utf8"] == true);
+        if !advanced && !pending {
+            anyhow::bail!("--max-bytes {cap} cannot hold the next log unit; increase the cap");
+        }
+    }
+    Ok((page, failed))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn incremental_scan_keeps_only_the_window_and_checks_the_whole_prefix() {
+        use std::io::{Seek, SeekFrom};
+        struct Fixture(std::path::PathBuf);
+        impl Drop for Fixture {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_file(&self.0);
+            }
+        }
+        let path =
+            Fixture(std::env::temp_dir().join(format!("qex-c-scan-{}", uuid::Uuid::new_v4())));
+        let mut raw = vec![b'a'; 150000];
+        let note = b"[qex] The output of this job reached the limit";
+        raw[65520..65520 + note.len()].copy_from_slice(note); // Cross a scan boundary.
+        std::fs::write(&path.0, &raw).unwrap();
+        let mut file = std::fs::File::open(&path.0).unwrap();
+        let (hash, old, window, loss) =
+            scan_log(&mut file, raw.len() as u64, 70000, 120, 128).unwrap();
+        assert_eq!(window, raw[120..248]);
+        assert!(loss);
+        assert_eq!(hash, log_fingerprint(0xcbf29ce484222325, &raw));
+        assert_eq!(old, log_fingerprint(0xcbf29ce484222325, &raw[..70000]));
+        file.seek(SeekFrom::Start(0)).unwrap();
+        let (second, _, empty, _) = scan_log(&mut file, raw.len() as u64, 0, 0, 0).unwrap();
+        assert_eq!(second, hash);
+        assert!(empty.is_empty());
+        raw[69999] = b'z'; // A rewrite outside the retained candidate window.
+        std::fs::write(&path.0, &raw).unwrap();
+        file.seek(SeekFrom::Start(0)).unwrap();
+        let (_, changed, window, _) =
+            scan_log(&mut file, raw.len() as u64, 70000, 120, 128).unwrap();
+        assert_eq!(window.len(), 128);
+        assert_ne!(changed, old);
+    }
+
+    #[test]
+    fn incremental_prefix_counts_original_bytes_at_every_boundary() {
+        let bytes = b"a\"\\\n\0\xe2\x82\xac\xf0\x9f\x98\x80\xff\xe2\x82";
+        for terminal in [false, true] {
+            for cap in 0..=bytes.len() {
+                let (text, used) = log_prefix(bytes, cap, terminal);
+                assert!(used <= cap);
+                assert_eq!(text, String::from_utf8_lossy(&bytes[..used]));
+                if !terminal {
+                    assert!(used <= bytes.len() - 2);
+                }
+            }
+        }
+        assert_eq!(log_prefix(b"\xe2\x82", 2, false), (String::new(), 0));
+        assert_eq!(log_prefix(b"\xe2\x82", 2, true), ("\u{fffd}".into(), 2));
+        assert_eq!(log_prefix(b"\xe2\x82\xac", 2, false), (String::new(), 0));
+        assert_eq!(log_prefix(b"\xe2\x82\xac", 3, false), ("€".into(), 3));
+    }
+
+    #[test]
+    fn incremental_cursor_rejects_malformed_versions_and_offsets() {
+        for raw in ["", "qlog1-0", "qlog1-zz", "qlog2-00", "qlog1-c3a9"] {
+            assert!(LogCursor::decode(raw).is_none(), "{raw}");
+        }
+        let mut c = LogCursor {
+            v: 1,
+            j: uuid::Uuid::new_v4(),
+            s: vec![LogPosition {
+                n: "stdout".into(),
+                m: Some((1, 2, 3, 4)),
+                o: 3,
+            }],
+        };
+        assert_eq!(LogCursor::decode(&c.encode()).unwrap().s[0].o, 3);
+        c.s[0].o = 4;
+        assert!(LogCursor::decode(&c.encode()).is_none());
+        c.s[0].o = 0;
+        c.v = 2;
+        assert!(LogCursor::decode(&c.encode()).is_none());
+    }
 
     fn sel() -> LogSelect {
         LogSelect::default()
