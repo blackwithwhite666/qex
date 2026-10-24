@@ -469,9 +469,12 @@ mod tests {
         assert!(Route::validate(&f.route.socket, Some(Path::new("client"))).is_err());
         use std::os::unix::ffi::OsStrExt;
         let bad_socket = f.root.join(std::ffi::OsStr::from_bytes(b"\xff"));
+        // macOS rejects invalid-byte filenames; validation checks UTF-8 before metadata.
+        #[cfg(not(target_os = "macos"))]
         let _bad_listener = UnixListener::bind(&bad_socket).unwrap();
         assert!(Route::validate(&bad_socket, Some(&f.route.client)).is_err());
         let bad_client = f.root.join(std::ffi::OsStr::from_bytes(b"\xff\xfe"));
+        #[cfg(not(target_os = "macos"))]
         std::fs::copy(&f.route.client, &bad_client).unwrap();
         assert!(Route::validate(&f.route.socket, Some(&bad_client)).is_err());
         std::fs::set_permissions(&f.route.client, std::fs::Permissions::from_mode(0o600)).unwrap();
