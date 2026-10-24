@@ -1,0 +1,57 @@
+# Agent interface and completion notifications
+
+Status: accepted for implementation (plan-r1). Source baseline: 213df1f. User authorization: repair the ten observed interface problems, merge the verified combined candidate to main, and install its qex binary. Local iterations run affected tests only. The lead runs the full repository checks once the entire batch is ready for integration.
+
+## User outcome
+
+An agent starts a queued check, retains its exact job ID, and receives a bounded result that distinguishes a finished job from an expired observation. It can read several jobs together and continue a log without replaying old output. The CLI explains its actual commands. Waiting requires no rapid model polling. Where an authenticated Codex completion route is available, one completion resumes the exact owning thread.
+
+For example, `qex submit --agent --cpu 2 --mem 3GB -- make test` uses minimal environment capture, waits for a bounded observation, and returns the same compact JSON envelope as `qex status ID --agent --wait`. A timeout leaves the job active and returns its ID and a bounded command for reattachment. Legacy invocations retain their output shape and exit-code meanings.
+
+## Accepted requirements
+
+1. Agent instructions keep one native wait per exact live job/process handle, use long host waits within the harness limit, align inner and outer observation limits, and avoid parallel snapshots or unchanged commentary without a diagnostic purpose.
+2. Explicit aliases distinguish job runtime (`--job-timeout`), observation (`--wait-timeout`), queue admission (`--queue-timeout`, alias of `--max-queue-time`) and coordinator RPC (`--rpc-timeout`). Existing `--timeout` meanings stay compatible.
+3. Invalid options produce relevant corrections and an executable valid example; the queue-timeout spelling must never suggest quiet mode. Validation happens before starting work.
+4. Machine-readable command discovery derives from the real CLI and distinguishes commands from protocol capabilities. Include argument shapes and actual output schema names; never advertise history/learn/query as CLI verbs.
+5. An opt-in agent result has a stable shape for submit, status and wait. It carries exact job IDs, job state, original job exit code/signal, observation outcome, blocking reason, bounded output and an argv array for continuing observation. A timed-out observation is never a failed job. Raw legacy JSON remains compatible.
+6. Readers can select known fields, bound output bytes, and read logs incrementally using a returned cursor. Byte limits apply to encoded output, including JSON escaping. Cursor advancement must not skip undisplayed bytes; job mismatch, log rewrite/rotation, dropped data and invalid cursors must be explicit. Existing selection and follow behavior stays compatible.
+7. `qex status A B --json` supports several exact IDs, preserves a single-ID response shape, and gives coherent batch results and existing exit-code rules. Missing targets and partial reads are explicit, and waits share one whole-command deadline.
+8. `--agent` supplies minimal environment capture unless explicitly overridden, bounded observation and compact output. It does not silently change resource estimates or introduce tool worker counts. Claims and their existing hint behavior remain visible and controllable.
+9. An offline client version check needs no coordinator. Diagnostic version output preserves the client identity when the coordinator is unreachable, distinguishes unreachable from absent, and gives actionable socket guidance.
+10. Investigate and implement the smallest supported completion-triggered Codex route. A transport/process event or history injection alone is not model resumption. Use explicit exact target ownership and an authenticated supported route; no private socket bypass, guessed thread, broad queue control or automatic host configuration. Acceptance must observe a real exact-thread successor without a model polling loop. Use the existing public Padavan route for an explicitly opted-in owning Codex session. Direct arbitrary UI/exec attachment is unsupported without an owner-supplied endpoint; never infer one from the thread UUID. This limitation is explicit in command help and agent guidance.
+
+## Architecture and limits
+
+Extend the existing Clap CLI, status reader, native wait and log selector. Reuse the persistent job records, existing coordinator protocol and stop-hook/event machinery. Avoid a second scheduler, controller, generic plugin framework, whole-environment capture or external service.
+
+The agent response is opt-in and versioned. Its minimal record excludes full command/environment/process ancestry unless explicitly requested. Selectors reject unknown fields. Defaults bound output; a budget smaller than required metadata yields a clear error rather than malformed JSON or silently omitted jobs. Logs use task-bound offsets and detect retention rewrites; cursors are data, not file paths. No new persistent cursor database is required.
+
+Wait deadlines govern observation, not job termination. RPC limits bound coordinator operations without turning long job waits into short RPC failures. Multi-job output does not grant ownership or permission to stop any job. Existing exit codes, deduplication, retry and cancellation behavior are preserved.
+
+The notification route is `--notify-padavan ABSOLUTE_EXECUTABLE` on submit. It is opt-in, bound to the exact current Padavan Codex owner using the injected session/root/incarnation markers and a fresh verified native agent ID. Validation happens before job admission. An absent/mismatched/ambiguous owner fails before submission. A different or unbound deduplicated job cannot silently acquire this route. The adapter calls the supplied public executable at the exact recorded root with `send --to-agent-id codex:THREAD --delivery asap --json`; active delivery steers the exact turn, and idle delivery starts the next turn on the same thread. qex never accesses private provider sockets. Use an explicit sender attribution that identifies this as a qex completion observation, not a new human instruction.
+
+Store one private notification registration/outcome beside the existing job record, under the job directory lifetime and clean rules. The submitting client writes the immutable owner route and reconciles already-terminal status. All supervisor/coordinator terminal paths dispatch using the existing terminal-hook coverage, independently of global hook filtering and hook.ran. Use an atomic per-job claim/lock so registration versus completion and duplicate terminal paths cannot start two sends. Dispatch runs outside the scheduler critical path, with bounded time/output and no notification failure changing job success. Persist attempted/receipt/failure evidence atomically. A crash or lost reply after possible dispatch remains visibly unknown and is never automatically reissued with a new request ID. Retain actual request ID and retry binding when supplied; no fabricated retries, background model polling or new controller. Notifications contain only job ID/state/code and a read-result argv, never environment, command content or raw private logs. Stored registration, attempt and result are removed with the job by existing cleanup.
+
+Evidence: task-owned installed Codex schema/protocol probe and existing Padavan native actor source, summarized in `/tmp/qex-agent-ux-20261024/notification-preliminary.md`; inspect primary source and final research evidence before acceptance. The direct Codex queue probe proves enqueue only and is not a wakeup guarantee. Final acceptance must use a task-owned real Padavan Codex owner that settles idle before its qex job finishes, then inspect a correlated successor Result on the same native thread with no model polling.
+
+## Execution plan and estimates
+
+Four stacked PR artifacts, each with fewer than 2000 agent-authored added code lines including tests. The feature estimate is 4100 such lines, not a human-imposed feature cap. Basis: existing Clap arg structs and embedded schemas; native status/wait/report functions; shared log selector and bounded log writer; existing hooks/events. Reassess the estimate after the notification prototype; simplify before expanding mechanisms.
+
+A. CLI discovery, timeout aliases/corrections and offline diagnostics (requirements 2–4, 9). Base: main at 213df1f. Estimate 800 authored added code lines including focused CLI/e2e tests.
+B. Agent envelope/profile, field selection and batch status (requirements 5, 7, 8 and field selection in 6). Base: A. Estimate 1200 lines including tests. Reuse existing resolution/wait behavior; do not create a new status service.
+C. Bounded incremental log reads (remaining requirement 6). Base: B. Estimate 1000 lines including cursor, encoding-budget and rewrite tests.
+D. Waiting instructions and verified completion delivery (requirements 1, 10). Base: C. Estimate 1100 lines including focused notification tests. Reuse the public Padavan send route and qex terminal-hook coverage; no separate transport/controller.
+
+Executor for implementation: native Codex gpt-6.1-sol, high reasoning, via installed Padavan in isolated worktrees. The model is available in the installed native catalog and suited to bounded Rust CLI changes with explicit behavioral tests. Independent plan/candidate reviewer: native gpt-6-astra, high reasoning, distinct from the executor. The lead owns specification, Beads, commits, PR publication, integration, installation and acceptance. Executors return uncommitted artifacts, exact focused checks and limitations and cannot change the plan or deliver.
+
+## Verification and delivery
+
+Workers run only focused tests for the behavior they change through installed qex, with deliberate whole-CPU/memory claims and actual Cargo/test concurrency. Preserve e2e concurrency at at most two tests, as repository CI requires. No full suites before the complete batch is ready.
+
+The lead pins the combined candidate, reviews each PR against its immediate base, and runs the final repository gates: formatting, clippy with warnings denied, binary unit tests, e2e tests with two test threads, compute-version tests, build-version tests and the declared MSRV check when that toolchain is available. Platform-specific CI evidence is reused when applicable; unavailable platform evidence is reported honestly. New changes after acceptance invalidate only affected evidence and require necessary combined verification.
+
+Before transfer, inspect remote destination and outgoing payload. Integrate the accepted combined candidate to the personal origin main without force pushing and respect actual branch gates. Follow CONTRIBUTING.md: publish PRs and use squash merge; never push main directly. Publish the stack only when the whole batch is ready, so required full CI starts at the final integration stage. After each squash, prepare the next unpublished branch on the new main from its already-reviewed patch; no force push or skipped required gate. Build the final release artifact through qex, install only the verified binary at the resolved qex destination, and verify installed digest, version and applicable smoke behavior. Do not replace a running coordinator in a way that interrupts other users' jobs; inspect the supported binary-replacement behavior first.
+
+Completion requires requirement-by-requirement evidence for all ten items, main integration, installed artifact identity and smoke results. Source merge alone is insufficient.
