@@ -67,6 +67,8 @@ mod logcap;
 #[cfg(unix)]
 mod logsel;
 #[cfg(unix)]
+mod notify;
+#[cfg(unix)]
 mod paths;
 #[cfg(unix)]
 mod pause;

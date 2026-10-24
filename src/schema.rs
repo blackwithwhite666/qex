@@ -588,6 +588,17 @@ pub const STATUS: &str = r##"{
       "format": "uuid",
       "description": "For a job in the state skipped, the first job that failed. This value is the root cause, and not the job before this one, so one read gives the true cause of a pipeline failure."
     },
+    "notification": {
+      "type": "object",
+      "description": "Present only for an opt-in Codex completion registration. This does not change job outcome. Enqueued proves queue acceptance, not a completed model turn. Attempts are never automatically resent.",
+      "required": ["state", "detail"],
+      "properties": {
+        "state": {"enum": ["pending", "attempting", "enqueued", "failed", "unknown"]},
+        "detail": {"type": "string"},
+        "queue_id": {"type": "string", "format": "uuid"},
+        "client_exit": {"type": "integer"}
+      }
+    },
     "logs_dropped": {
       "type": ["object", "null"],
       "description": "What qex removed from the output files, because the job wrote more than [logs] max_bytes. The value is null when qex kept everything. qex keeps the first part and the last part of each file, and it writes a line between them that says how much went. The removed lines are NOT on the disk, so no option of `qex logs` gives them back.",

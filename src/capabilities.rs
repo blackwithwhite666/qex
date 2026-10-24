@@ -190,6 +190,7 @@ pub const ALL: &[&str] = &[
     "learn",
     "locks",
     "max-queue-time",
+    "notify-codex",
     "own-job",
     "pause",
     "pause-requests",
@@ -1007,6 +1008,21 @@ mod tests {
             .filter(|c| **c != name)
             .map(|c| c.to_string())
             .collect()
+    }
+
+    #[test]
+    fn notify_capability_refuses_a_coordinator_without_callback_support() {
+        let err = check_command(
+            &without("notify-codex"),
+            "9.0.0",
+            123,
+            "notify-codex",
+            "qex submit --notify-codex",
+            "The callback would not run.",
+        )
+        .unwrap_err();
+        assert!(err.contains("qex submit --notify-codex"));
+        assert!(err.contains("The callback would not run"));
     }
 
     fn stage(name: &str, needs: &[&'static str]) -> StageNeeds {

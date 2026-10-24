@@ -47,6 +47,31 @@ find the coordinator, use `qex info` — never search the process list.
 
 ## Which command
 
+Keep one native wait for each exact job. If a host call yields a live process
+handle, resume that same handle with long waits, for example 60 seconds within
+the host limit. A host yield is not a qex exit. Do not start another wait or
+repeat status snapshots while the native wait is active. Reattach to the
+same job only after qex exits with observation timeout 124 or interruption
+122. Never resubmit to resume observation. Keep qex's observation limit below
+the outer command limit. Skip unchanged queue snapshots and commentary unless
+you need them to answer a diagnostic question.
+
+An agent with an explicitly owned public Codex app-server socket can use
+`qex submit --agent --notify-codex /absolute/public.sock --cpu 1 --mem 3GB -- COMMAND`.
+This validates the caller's `CODEX_THREAD_ID`, registers one completion
+observation through the installed public queue client, and returns a compact
+snapshot. Keep the ID and end the turn while the callback is pending. An
+explicit `--wait` or `--wait-timeout` keeps inline waiting. Without notification,
+`--agent` retains its bounded inline-wait default. Choose one completion mode;
+do not add a polling loop. Claims and actual worker counts remain explicit.
+`--codex-client /absolute/codex` selects a client instead of PATH resolution.
+The socket must belong to the owner of that exact thread. Arbitrary UI/exec
+attachment without an owner-supplied public endpoint is unsupported. Never
+infer or discover private sockets from a thread UUID. `notification` in status
+reports pending, attempting, enqueued, failed or unknown. Enqueued proves queue
+acceptance; final model completion is a separate observation. Uncertain
+attempts are never automatically resent. Read the exact job result on resumption.
+
 | I want | Start the job | Attach to a job |
 | --- | --- | --- |
 | The output as it arrives | `qex run -- CMD` (= `qex submit --follow`) | `qex status <id> --follow` |
@@ -71,8 +96,8 @@ qex submit --wait --cpu 2 --mem 4GB --id-file build.id -- make release
 - One command. A submission and a separate wait is two, and the second is a
   thing to forget: a job that nobody waits for still runs, and nobody reads the
   result.
-- Your harness waits, because the command waits. Run it as a background command
-  and the harness reports the end — no timer, no second command.
+- Retain the host's exact live or background process handle and resume it.
+  The native wait gives the result without a timer or another qex process.
 - **A subagent waits in the foreground.** A harness often does not wake a
   subagent when a background command ends. Such a harness resumes the subagent
   only when the parent sends a message. A subagent that ends its turn to wait

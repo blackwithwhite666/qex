@@ -52,7 +52,48 @@ value counts, defaults, conflicts and published output schema names. Read the
 no published schema. `protocol_capabilities` names coordinator features;
 `history`, `learn` and `query` in that list are not CLI commands.
 
-### Incremental logs
+### Codex completion observations
+
+`submit --notify-codex ABSOLUTE_SOCKET` registers one callback to the caller's
+canonical non-nil `CODEX_THREAD_ID` UUID. The socket must be owned by the caller
+and in an owner-controlled directory. Supply an existing public local app-server
+socket for that exact thread; qex never discovers private provider endpoints.
+Arbitrary UI/exec attachment without such an endpoint is unsupported.
+`--codex-client ABSOLUTE_EXECUTABLE` selects the public client; otherwise qex
+resolves codex from PATH once. Inputs fail before submission. An older
+coordinator without `notify-codex` support is refused before admission. Socket
+and client paths must be UTF-8 for the public URI and persisted registration.
+
+The callback runs `codex queue --remote unix://SOCKET --thread UUID --message TEXT`.
+Its fixed untrusted observation contains only the exact job UUID, terminal
+state, original exit code/signal and a result-retrieval argv. A private immutable
+registration binds the job and owner route. Identical dedupe ownership is
+idempotent; different or absent ownership cannot adopt the existing job.
+Post-admission registration faults keep the exact ID on stderr and in the
+requested ID file. They return a qex fault without undoing the admitted job.
+
+With `--agent`, notification submission returns a compact snapshot by default.
+An explicit `--wait` or `--wait-timeout` preserves inline waiting. Without
+notification, agent defaults are unchanged. Streaming/run and fanout modes
+are incompatible. Resource claims and worker counts are unchanged.
+
+The optional `notification` status field reports pending, attempting, enqueued,
+failed or unknown. Enqueued establishes one valid exact-thread queue receipt,
+not a completed model turn. Failure reports validation, spawn or client failure;
+it does not prove that a remote request had no effect. Timeout, excess output,
+malformed receipts or a lost outcome remain unknown. No attempted callback is
+automatically resent, including after a crash. A claimed attempt with no outcome
+becomes unknown after its 30-second client limit and a short cleanup allowance.
+There is no crash-proof exactly-once guarantee. Job outcomes remain unchanged.
+
+The child process group has a 30-second limit and a 4096-byte combined-output
+cap. qex kills remaining group children before reaping the client. Registration,
+claim and bounded outcome evidence are private files beside the job record and
+follow job cleanup. Status omits client output and route paths. Global hooks,
+their state filter and hook.ran do not control this callback. Workload stdout,
+stderr, commands and environment are never included in the completion text.
+
+### Incremental log pages
 
 ```sh
 qex logs ID --json --incremental --stdout --max-bytes 16384

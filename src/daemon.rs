@@ -1421,7 +1421,11 @@ fn recover(coord: &Arc<Coordinator>) -> Result<()> {
                     // when the job stops.
                     let coord2 = Arc::clone(coord);
                     let id = status.id;
-                    std::thread::spawn(move || crate::supervisor::reap(coord2, id, pid));
+                    let work = crate::hook::retain_coordinator_work();
+                    std::thread::spawn(move || {
+                        let _work = work;
+                        crate::supervisor::reap(coord2, id, pid);
+                    });
                 }
             } else if job_alive {
                 // The supervisor is gone, and the job process continues. No
@@ -1696,9 +1700,21 @@ fn serve(coord: Arc<Coordinator>, stream: UnixStream) -> Result<()> {
             continue;
         }
 
-        coord.state.lock().unwrap().last_contact = Instant::now();
-
         let parsed = serde_json::from_str::<Request>(&line);
+        let work = {
+            let mut state = coord.state.lock().unwrap();
+            if state.stop {
+                break;
+            }
+            state.last_contact = Instant::now();
+            // Only these producers dispatch after releasing the state lock.
+            // Passive readers, especially Events, must not prevent idle exit.
+            matches!(
+                &parsed,
+                Ok(Request::NotifyCodex { .. } | Request::Abort { .. })
+            )
+            .then(crate::hook::retain_coordinator_work)
+        };
 
         // The event stream gives many answers to one request, so it takes this
         // connection for the rest of its life. Every other request gives one
@@ -1729,6 +1745,7 @@ fn serve(coord: Arc<Coordinator>, stream: UnixStream) -> Result<()> {
             ),
         };
 
+        drop(work);
         let mut text = serde_json::to_string(&response).context("writing the answer")?;
         text.push('\n');
         if writer.write_all(text.as_bytes()).is_err() {
@@ -1743,6 +1760,17 @@ fn serve(coord: Arc<Coordinator>, stream: UnixStream) -> Result<()> {
 fn handle(coord: &Arc<Coordinator>, request: Request, peer: Option<i32>) -> Response {
     match request {
         Request::Ping => Response::Ok,
+        Request::NotifyCodex { id } => {
+            match paths::job_dir(&id)
+                .and_then(|dir| job::read_status(&dir).map(|status| (dir, status)))
+            {
+                Ok((dir, status)) => {
+                    crate::hook::fire_detached(&dir, &status);
+                    Response::Ok
+                }
+                Err(_) => no_such_job(id),
+            }
+        }
         // `serve` answers this one, because the ownership belongs to a
         // connection and this function has none. A request that arrives here
         // comes from a caller that qex does not have, so it gets a refusal and
@@ -2840,6 +2868,7 @@ fn handle_wait(coord: &Arc<Coordinator>, id: uuid::Uuid) -> Response {
 /// text on a cancelled record tells a reader that the job failed and starts
 /// again, and both of those are then false.
 fn cancel_queued(coord: &Arc<Coordinator>, id: uuid::Uuid, reason: Option<String>) -> bool {
+    let _work = crate::hook::retain_coordinator_work();
     let mut state = coord.state.lock().unwrap();
 
     let Some(job) = state.jobs.get_mut(&id) else {
@@ -2949,7 +2978,9 @@ fn idle_watch(coord: Arc<Coordinator>, socket: std::path::PathBuf) {
         let should_stop = {
             let mut state = coord.state.lock().unwrap();
             let active = state.count_state(|s| !s.is_terminal());
-            let idle = active == 0 && (replaced || state.last_contact.elapsed() >= idle_limit);
+            let idle = active == 0
+                && !crate::hook::coordinator_work_active()
+                && (replaced || state.last_contact.elapsed() >= idle_limit);
             if idle {
                 state.stop = true;
             }

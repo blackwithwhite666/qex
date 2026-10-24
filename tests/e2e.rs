@@ -1101,9 +1101,12 @@ fn the_help_of_submit_says_that_the_id_goes_to_stderr() {
     let h = Harness::with_default_config("submithelp");
     let text = String::from_utf8_lossy(&h.qex(&["submit", "--help"]).stdout).to_string();
     let wait_part = text
-        .split("--wait")
+        .split("\n      --wait\n")
         .nth(1)
         .expect("`--wait` must be in the help of `qex submit`")
+        .split("\n      --")
+        .next()
+        .unwrap()
         .to_string();
     assert!(
         wait_part.contains("STDERR") || wait_part.contains("stderr"),
@@ -20608,11 +20611,13 @@ fn qex_b_agent_minimal_environment_and_explicit_overrides() {
     ] {
         let mut args = vec!["submit", "--agent", "--fields", "state,env,resources"];
         args.extend(extra);
-        args.extend(["--", "/bin/true"]);
+        args.extend(["--", "/bin/sh", "-c", ":"]);
         let out = qex(&args);
         assert!(
             out.status.success(),
-            "{}",
+            "status: {}\nstdout: {}\nstderr: {}",
+            out.status,
+            String::from_utf8_lossy(&out.stdout),
             String::from_utf8_lossy(&out.stderr)
         );
         let value: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
@@ -21383,6 +21388,287 @@ fn qex_c_live_retention_loss_and_queued_empty_cursor() {
             > 0
     );
     assert!(!path.with_extension("log.tail").exists());
+    drop(h);
+    assert!(Instant::now() < end);
+}
+
+fn d_client(h: &Harness, thread: &str) -> (std::os::unix::net::UnixListener, PathBuf) {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&h.root, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let listener = std::os::unix::net::UnixListener::bind(h.root.join("s")).unwrap();
+    let client = h.root.join("codex");
+    std::fs::write(&client, format!("#!/bin/sh\nprintf '%s\\n' \"$@\" >> '{}'\nprintf 'Queued message 01900000-0000-7000-8000-000000000010 for thread {thread}.\\n'\n", h.root.join("sent").display())).unwrap();
+    std::fs::set_permissions(&client, std::fs::Permissions::from_mode(0o700)).unwrap();
+    (listener, client)
+}
+
+fn d_outcome(h: &Harness, id: &str, deadline: Instant) -> serde_json::Value {
+    let path = h.job_dir(id).join("notify-codex.outcome.json");
+    loop {
+        if let Ok(bytes) = std::fs::read(&path) {
+            return serde_json::from_slice(&bytes).unwrap();
+        }
+        assert!(
+            Instant::now() < deadline,
+            "notification outcome missing for {id}"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+#[test]
+fn qex_d_callback_agent_snapshot_and_explicit_wait_compose() {
+    let end = Instant::now() + Duration::from_secs(50);
+    let deadline = end - 2 * STOP_LIMIT;
+    let mut h = Harness::with_default_config("dn");
+    let thread = uuid::Uuid::new_v4().to_string();
+    h.extra_env.push(("CODEX_THREAD_ID".into(), thread.clone()));
+    let (_listener, client) = d_client(&h, &thread);
+    let qex = |args: &[&str]| h.command_until(h.command(args), &args.join(" "), deadline);
+    let socket = h.root.join("s");
+    let route = [
+        "--notify-codex",
+        socket.to_str().unwrap(),
+        "--codex-client",
+        client.to_str().unwrap(),
+    ];
+    let pause: serde_json::Value =
+        serde_json::from_str(&b_ok(&qex, &["pause", "queue", "--json"])).unwrap();
+    let started = Instant::now();
+    let out = qex(&[
+        &["submit", "--agent", "--cpu", "1", "--mem", "1MB"][..],
+        &route,
+        &["--", "sh", "-c", "printf private-log >&2; exit 7"],
+    ]
+    .concat());
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "callback submission waited inline"
+    );
+    let result: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(result["observation"], "snapshot");
+    let row = &result["results"][0];
+    let id = row["id"].as_str().unwrap();
+    assert_eq!(row["state"], "queued");
+    assert_eq!(row["notification"]["state"], "pending");
+    assert_eq!(row["resources"]["cpu"], 1);
+    let spec: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(h.job_dir(id).join("spec.json")).unwrap()).unwrap();
+    assert_eq!(spec["env_capture"], "minimal");
+    b_ok(
+        &qex,
+        &[
+            "resume",
+            "queue",
+            "--pause",
+            pause["pause_id"].as_str().unwrap(),
+        ],
+    );
+    assert_eq!(
+        qex(&["wait", id, "--timeout", "15s"]).status.code(),
+        Some(7)
+    );
+    assert_eq!(d_outcome(&h, id, deadline)["view"]["state"], "enqueued");
+    let status: serde_json::Value = serde_json::from_str(&b_ok(
+        &qex,
+        &[
+            "status",
+            id,
+            "--agent",
+            "--fields",
+            "notification,exit_code",
+        ],
+    ))
+    .unwrap();
+    assert_eq!(status["results"][0]["exit_code"], 7);
+    assert_eq!(status["results"][0]["notification"]["state"], "enqueued");
+    assert!(!std::fs::read_to_string(h.root.join("sent"))
+        .unwrap()
+        .contains("private-log"));
+    for explicit in [vec!["--wait"], vec!["--wait-timeout", "15s"]] {
+        let out = qex(&[
+            &["submit", "--agent"][..],
+            &route,
+            &explicit,
+            &["--", "true"],
+        ]
+        .concat());
+        assert!(out.status.success());
+        let value: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+        assert_eq!(value["observation"], "complete");
+        d_outcome(&h, value["results"][0]["id"].as_str().unwrap(), deadline);
+    }
+    let legacy = b_submit(&qex, &["submit", "--", "true"]);
+    b_ok(&qex, &["wait", &legacy, "--timeout", "15s"]);
+    let legacy: serde_json::Value =
+        serde_json::from_str(&b_ok(&qex, &["status", &legacy, "--json"])).unwrap();
+    assert!(legacy.get("notification").is_none());
+    drop(h);
+    assert!(Instant::now() < end);
+}
+
+#[test]
+fn qex_d_cancel_skip_and_dedupe_are_independent_of_global_hooks() {
+    let end = Instant::now() + Duration::from_secs(50);
+    let deadline = end - 2 * STOP_LIMIT;
+    let mut h = Harness::new("dd", "[peers]\nenabled = false\n[system]\nreserve_mem = \"0\"\nmax_pressure = 100\n[hooks]\non_stop = [\"true\"]\non_stop_states = [\"failed\"]\n");
+    let thread = uuid::Uuid::new_v4().to_string();
+    h.extra_env.push(("CODEX_THREAD_ID".into(), thread.clone()));
+    let (_listener, client) = d_client(&h, &thread);
+    let socket = h.root.join("s");
+    let route = [
+        "--notify-codex",
+        socket.to_str().unwrap(),
+        "--codex-client",
+        client.to_str().unwrap(),
+    ];
+    let qex = |args: &[&str]| h.command_until(h.command(args), &args.join(" "), deadline);
+    let pause: serde_json::Value =
+        serde_json::from_str(&b_ok(&qex, &["pause", "queue", "--json"])).unwrap();
+    let args = [
+        &["submit", "--dedupe-key", "owned"][..],
+        &route,
+        &["--", "true"],
+    ]
+    .concat();
+    let id = b_submit(&qex, &args);
+    assert_eq!(b_submit(&qex, &args), id);
+    let mut foreign = h.command(&args);
+    foreign.env("CODEX_THREAD_ID", uuid::Uuid::new_v4().to_string());
+    let out = h.command_until(foreign, "foreign notification owner", deadline);
+    assert_eq!(out.status.code(), Some(121));
+    assert!(String::from_utf8_lossy(&out.stderr).contains(&id));
+    std::fs::write(h.job_dir(&id).join("hook.ran"), "already claimed").unwrap();
+    let plain = b_submit(&qex, &["submit", "--dedupe-key", "unbound", "--", "true"]);
+    let adoption = qex(&[
+        &["submit", "--dedupe-key", "unbound"][..],
+        &route,
+        &["--", "true"],
+    ]
+    .concat());
+    assert_eq!(adoption.status.code(), Some(121));
+    assert!(String::from_utf8_lossy(&adoption.stderr).contains(&plain));
+    b_ok(&qex, &["cancel", &id, &plain]);
+    assert_eq!(d_outcome(&h, &id, deadline)["view"]["state"], "enqueued");
+    assert_eq!(
+        std::fs::read_to_string(h.root.join("sent"))
+            .unwrap()
+            .lines()
+            .count(),
+        7
+    );
+    assert!(!h.job_dir(&plain).join("notify-codex.json").exists());
+    let parent = b_submit(&qex, &["submit", "--", "sh", "-c", "exit 3"]);
+    let skipped = b_submit(
+        &qex,
+        &[&["submit", "--needs", &parent][..], &route, &["--", "true"]].concat(),
+    );
+    b_ok(
+        &qex,
+        &[
+            "resume",
+            "queue",
+            "--pause",
+            pause["pause_id"].as_str().unwrap(),
+        ],
+    );
+    assert_eq!(
+        qex(&["wait", &skipped, "--timeout", "15s"]).status.code(),
+        Some(126)
+    );
+    assert_eq!(
+        d_outcome(&h, &skipped, deadline)["view"]["state"],
+        "enqueued"
+    );
+    assert!(!h.job_dir(&skipped).join("hook.ran").exists());
+    assert_eq!(
+        std::fs::read_to_string(h.root.join("sent"))
+            .unwrap()
+            .lines()
+            .count(),
+        14
+    );
+    drop(h);
+    assert!(Instant::now() < end);
+}
+
+#[test]
+fn qex_d_invalid_inputs_fail_before_admission_and_path_resolves_once() {
+    let end = Instant::now() + Duration::from_secs(45);
+    let deadline = end - 2 * STOP_LIMIT;
+    let mut h = Harness::with_default_config("dv");
+    let thread = uuid::Uuid::new_v4().to_string();
+    h.extra_env.push(("CODEX_THREAD_ID".into(), thread.clone()));
+    let (_listener, client) = d_client(&h, &thread);
+    let socket = h.root.join("s");
+    let route = [
+        "--notify-codex",
+        socket.to_str().unwrap(),
+        "--codex-client",
+        client.to_str().unwrap(),
+    ];
+    for thread in [None, Some("wrong")] {
+        let mut cmd = h.command(&[&["submit"][..], &route, &["--", "true"]].concat());
+        cmd.env_remove("CODEX_THREAD_ID");
+        if let Some(thread) = thread {
+            cmd.env("CODEX_THREAD_ID", thread);
+        }
+        let out = h.command_until(cmd, "invalid caller thread", deadline);
+        assert_eq!(out.status.code(), Some(121));
+        assert!(!h.root.join("state/qex/jobs").exists());
+    }
+    let qex = |args: &[&str]| h.command_until(h.command(args), &args.join(" "), deadline);
+    for args in [
+        vec!["submit", "--notify-codex", "relative", "--", "true"],
+        vec![
+            "submit",
+            "--notify-codex",
+            socket.to_str().unwrap(),
+            "--codex-client",
+            "relative",
+            "--",
+            "true",
+        ],
+        [&["submit", "--follow"][..], &route, &["--", "true"]].concat(),
+        [
+            &["submit", "--each-line", "missing"][..],
+            &route,
+            &["--", "true"],
+        ]
+        .concat(),
+        [&["run"][..], &route, &["--", "true"]].concat(),
+    ] {
+        assert!(!qex(&args).status.success());
+        assert!(!h.root.join("state/qex/jobs").exists());
+    }
+    let mut cmd = h.command(&[
+        "submit",
+        "--notify-codex",
+        socket.to_str().unwrap(),
+        "--",
+        "/bin/sh",
+        "-c",
+        ":",
+    ]);
+    cmd.env("PATH", &h.root);
+    let out = h.command_until(cmd, "public client PATH resolution", deadline);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let id = String::from_utf8(out.stdout).unwrap();
+    let id = id.trim();
+    assert_eq!(d_outcome(&h, id, deadline)["view"]["state"], "enqueued");
+    let record: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(h.job_dir(id).join("notify-codex.json")).unwrap())
+            .unwrap();
+    assert_eq!(record["client"], client.to_str().unwrap());
     drop(h);
     assert!(Instant::now() < end);
 }
