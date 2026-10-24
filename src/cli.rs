@@ -176,6 +176,16 @@ pub enum Command {
 
 #[derive(Debug, Args)]
 pub struct SubmitArgs {
+    /// Queue one completion observation to this explicit owner-controlled public
+    /// Codex app-server socket. Requires the caller's CODEX_THREAD_ID UUID.
+    /// With --agent, returns a snapshot unless --wait/--wait-timeout is explicit.
+    #[arg(long, value_name = "ABSOLUTE_SOCKET", conflicts_with_all = ["follow", "each_line"])]
+    pub notify_codex: Option<PathBuf>,
+
+    /// Absolute public Codex queue client. Default: resolve codex from PATH once.
+    #[arg(long, value_name = "EXECUTABLE", requires = "notify_codex")]
+    pub codex_client: Option<PathBuf>,
+
     /// Cores for the job: a number, or `half`, `guess`, `full` or `max`.
     #[arg(long, value_name = "N|half|full", value_parser = parse_cpu_claim)]
     pub cpu: Option<crate::claim::Claim>,

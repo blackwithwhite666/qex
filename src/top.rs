@@ -1465,6 +1465,7 @@ mod tests {
     fn job(state: JobState, cpu: u64, mem: u64) -> JobStatus {
         JobStatus {
             id: uuid::Uuid::new_v4(),
+            notification: None,
             name: "example".into(),
             command: vec!["true".into()],
             cwd: "/".into(),

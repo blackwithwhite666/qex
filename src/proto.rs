@@ -41,6 +41,9 @@ use serde::{Deserialize, Serialize};
 pub enum Request {
     /// Tests that the coordinator operates.
     Ping,
+    /// Reconcile a caller-written notification registration with durable status.
+    /// Gated by notify-codex; does not change job outcome or notification owner.
+    NotifyCodex { id: uuid::Uuid },
     /// Puts a job in the queue.
     Submit {
         spec: Box<JobSpec>,

@@ -416,7 +416,9 @@ fn finish_removal(removal: Removal) -> Result<(), String> {
         .ok()
         .and_then(|cfg| cfg.hook_timeout().ok())
         .unwrap_or(std::time::Duration::from_secs(30));
-    while crate::hook::still_runs(&dir, limit, crate::sys::now_secs()) {
+    while crate::hook::still_runs(&dir, limit, crate::sys::now_secs())
+        || crate::notify::still_runs(&dir, removal.id)
+    {
         std::thread::sleep(std::time::Duration::from_millis(50));
     }
 

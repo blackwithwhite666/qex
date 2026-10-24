@@ -58,6 +58,28 @@ use crate::job::JobStatus;
 use std::path::Path;
 use std::time::{Duration, Instant};
 
+// Coordinator callbacks must keep their timeout owner alive through ordinary
+// idle/replacement shutdown. Producers retain work before making a job terminal
+// or handing its cleanup to another thread, so shutdown cannot miss that gap.
+static COORDINATOR_WORK: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+pub struct CoordinatorWork;
+
+pub fn retain_coordinator_work() -> CoordinatorWork {
+    COORDINATOR_WORK.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    CoordinatorWork
+}
+
+impl Drop for CoordinatorWork {
+    fn drop(&mut self) {
+        COORDINATOR_WORK.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+pub fn coordinator_work_active() -> bool {
+    COORDINATOR_WORK.load(std::sync::atomic::Ordering::SeqCst) != 0
+}
+
 /// The name of the file that says that the hook of this job ran.
 const CLAIM_FILE: &str = "hook.ran";
 
@@ -149,6 +171,8 @@ pub fn fire(origin: Origin, dir: &Path, status: &JobStatus) {
     if !status.state.is_terminal() {
         return;
     }
+
+    crate::notify::fire(dir, status);
 
     // The SHORT form of a fault in the file. This message goes into a log line
     // and not in front of a person whose command stopped. `Config::load` gives
@@ -299,9 +323,13 @@ pub fn fire_detached(dir: &Path, status: &JobStatus) {
     }
     let dir = dir.to_path_buf();
     let status = status.clone();
+    let work = retain_coordinator_work();
     // The thread reads the config file. The caller frequently holds the lock of
     // the queue, and a read of a file must not happen there.
-    std::thread::spawn(move || fire(Origin::Coordinator, &dir, &status));
+    std::thread::spawn(move || {
+        let _work = work;
+        fire(Origin::Coordinator, &dir, &status);
+    });
 }
 
 /// Takes the right to run the hook of this job. Gives `true` to the winner.

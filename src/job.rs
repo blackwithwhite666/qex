@@ -418,6 +418,9 @@ pub struct Ancestor {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct JobStatus {
     pub id: uuid::Uuid,
+    /// Read-time projection of the private per-job completion attempt.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub notification: Option<crate::notify::View>,
     pub name: String,
     /// The program and its arguments.
     ///
@@ -663,6 +666,7 @@ impl JobStatus {
     pub fn new(spec: &JobSpec) -> Self {
         Self {
             id: spec.id,
+            notification: None,
             name: spec.name.clone(),
             command: spec.command.clone(),
             cwd: spec.cwd.to_string_lossy().into_owned(),

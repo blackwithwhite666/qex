@@ -1859,6 +1859,7 @@ fn choose(state: &mut crate::daemon::State) -> Choice {
 
 /// Starts the supervisor of one job.
 fn start_job(coord: &Arc<Coordinator>, id: uuid::Uuid) -> anyhow::Result<()> {
+    let _work = crate::hook::retain_coordinator_work();
     // Take the job and test it again, with one lock only.
     //
     // The scheduler chose this job and then released the lock. In that moment,
@@ -2043,7 +2044,11 @@ fn start_job(coord: &Arc<Coordinator>, id: uuid::Uuid) -> anyhow::Result<()> {
             // One thread reads the result of each supervisor. The number of
             // jobs is small, so a thread for each job is not expensive.
             let coord = Arc::clone(coord);
-            std::thread::spawn(move || crate::supervisor::reap(coord, id, pid));
+            let work = crate::hook::retain_coordinator_work();
+            std::thread::spawn(move || {
+                let _work = work;
+                crate::supervisor::reap(coord, id, pid);
+            });
             Ok(())
         }
         Err(e) => {

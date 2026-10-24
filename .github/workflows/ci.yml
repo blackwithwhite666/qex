@@ -59,6 +59,8 @@ jobs:
       # shared machine change that load, so they run two at a time at the most.
       - name: The end-to-end tests
         run: cargo test --test e2e -- --test-threads=2
+      - name: Notification shutdown ownership
+        run: cargo test --test notify_shutdown -- --test-threads=1
 
   # The rules that give the version number of every release.
   #

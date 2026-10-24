@@ -107,6 +107,11 @@ fn code_for_a_resolver_error(error: &anyhow::Error) -> i32 {
 const AUTO_CLEAN_AGE: u64 = 3600;
 
 pub fn submit(args: cli::SubmitArgs) -> Result<i32> {
+    let notification = args
+        .notify_codex
+        .as_deref()
+        .map(|socket| crate::notify::Route::validate(socket, args.codex_client.as_deref()))
+        .transpose()?;
     // Reject a bad observation limit before any path can admit work.
     let wait_timeout = args
         .wait_timeout
@@ -126,7 +131,9 @@ pub fn submit(args: cli::SubmitArgs) -> Result<i32> {
         bail!("--wait-timeout needs --wait or --agent");
     }
     // Validate the profile's observation override before admission.
-    let agent_limit = if args.result.agent {
+    let agent_wait =
+        args.result.agent && (notification.is_none() || args.wait || args.wait_timeout.is_some());
+    let agent_limit = if agent_wait {
         Some(result_wait_limit(args.wait_timeout.as_deref())?)
     } else {
         None
@@ -222,6 +229,14 @@ pub fn submit(args: cli::SubmitArgs) -> Result<i32> {
     spec.needs = resolve_dependencies(&mut client, &deps.needs, "--needs")?;
     spec.after = resolve_dependencies(&mut client, &deps.after, "--after")?;
     require_capabilities(&mut client, &spec)?;
+    if notification.is_some() {
+        require_command(
+            &mut client,
+            "notify-codex",
+            "qex submit --notify-codex",
+            "An older coordinator cannot dispatch the registered completion callback.",
+        )?;
+    }
 
     match client.call(&Request::Submit {
         spec: Box::new(spec),
@@ -232,6 +247,21 @@ pub fn submit(args: cli::SubmitArgs) -> Result<i32> {
             warning,
             deduplicated,
         } => {
+            if let Some(route) = &notification {
+                // Admission already happened. Keep the exact ID even if later
+                // registration, reconciliation or response rendering fails.
+                say_the_id_and_write_the_file(id, args.id_file.as_ref());
+                if let Err(e) = (|| -> Result<()> {
+                    crate::notify::register(&paths::job_dir(&id)?, id, route, deduplicated)?;
+                    match client.call(&Request::NotifyCodex { id })? {
+                        Response::Ok => Ok(()),
+                        other => bail!("notification reconciliation failed: {other:?}"),
+                    }
+                })() {
+                    eprintln!("qex: job {id} was admitted, but notification registration/reconciliation failed: {e:#}");
+                    return Ok(EXIT_QEX_FAILED);
+                }
+            }
             // The warning goes to stderr. The id stays alone on stdout, so the
             // command `ID=$(qex submit ...)` continues to operate.
             //
@@ -242,12 +272,14 @@ pub fn submit(args: cli::SubmitArgs) -> Result<i32> {
             if let Some(text) = warning {
                 eprintln!("qex: {text}");
             }
-            if let Some(limit) = agent_limit {
-                say_the_id_and_write_the_file(id, args.id_file.as_ref());
+            if args.result.agent {
+                if notification.is_none() {
+                    say_the_id_and_write_the_file(id, args.id_file.as_ref());
+                }
                 return observe_results(
                     &[id.to_string()],
-                    true,
-                    Some(&limit),
+                    agent_wait,
+                    agent_limit.as_deref(),
                     &args.result,
                     true,
                     None,
@@ -262,7 +294,9 @@ pub fn submit(args: cli::SubmitArgs) -> Result<i32> {
             // The file reaches the disk BEFORE the wait, and it is closed, so
             // it is a handle after a crash and not after a tidy stop only.
             if args.wait {
-                say_the_id_and_write_the_file(id, args.id_file.as_ref());
+                if notification.is_none() {
+                    say_the_id_and_write_the_file(id, args.id_file.as_ref());
+                }
                 return wait_after_submit(
                     &id.to_string(),
                     wait_timeout,
@@ -286,8 +320,10 @@ pub fn submit(args: cli::SubmitArgs) -> Result<i32> {
             // The id is on stdout already, so a file that fails takes nothing
             // from the caller. Say the fault, and give the code of the fault:
             // the caller asked for that file, and a later command reads it.
-            if let Some(path) = &args.id_file {
-                write_id_file(path, &format!("{id}\n"))?;
+            if notification.is_none() {
+                if let Some(path) = &args.id_file {
+                    write_id_file(path, &format!("{id}\n"))?;
+                }
             }
             Ok(0)
         }
@@ -1314,6 +1350,7 @@ fn observe_results(
                             | "deduplicated"
                             | "error"
                             | "resources"
+                            | "notification"
                     )
                 });
             }
@@ -1831,6 +1868,13 @@ fn print_status(s: &JobStatus, show_env: bool) -> Result<()> {
     println!("id:        {}", s.id);
     println!("name:      {}", s.name);
     println!("state:     {}", s.state);
+    if let Some(n) = &s.notification {
+        println!(
+            "notification: {} ({})",
+            n.state,
+            crate::job::visible(&n.detail)
+        );
+    }
     // A pid that a reader can act on, and a pid that a reader must not act on,
     // get different words. After the job stops, the machine can give that
     // number to another process, so the line says `was`.
@@ -4387,6 +4431,9 @@ fn short_id(id: &uuid::Uuid) -> String {
 /// The record on the disk is not touched. `resolve_id` reads the stored name,
 /// so a user who knows the name that they gave still finds the job.
 fn for_display(mut s: JobStatus) -> JobStatus {
+    if let Ok(dir) = paths::job_dir(&s.id) {
+        s.notification = crate::notify::view(&dir, s.id);
+    }
     s.name = safe_name(&s.name);
     s.group_name = s.group_name.as_deref().map(safe_name);
     // A dedupe key is text that another agent chose, and `qex status` puts it
@@ -6432,6 +6479,9 @@ fn catch_run_signals() {
 /// stop the job. It continues, and `qex list` finds it. Use `qex submit` for
 /// work that must live longer than the command that starts it.
 pub fn run(args: cli::RunArgs) -> Result<i32> {
+    if args.submit.notify_codex.is_some() {
+        bail!("--notify-codex uses recorded submission; use qex submit --notify-codex SOCKET -- COMMAND");
+    }
     if args.submit.result.agent
         || !args.submit.result.fields.is_empty()
         || args.submit.result.max_bytes.is_some()
@@ -7677,6 +7727,7 @@ mod tests {
     fn status_with(state: JobState, code: Option<i32>) -> JobStatus {
         JobStatus {
             id: uuid::Uuid::new_v4(),
+            notification: None,
             name: "t".into(),
             command: vec!["true".into()],
             cwd: "/".into(),
