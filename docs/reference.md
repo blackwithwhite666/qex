@@ -31,9 +31,10 @@ qex events [--json] [--since STREAM:SEQ|start|now] [--count N] [--timeout TIME]
 qex info                    the coordinator: its pid, its budget and its load
 qex pause  [queue|lock NAME] [--reason TEXT] [--for TIME] [--drain]
 qex resume [queue|lock NAME] --pause ID
-qex version [--check] [--json]   the versions, and whether a newer one exists
+qex version [--client|--check] [--json]   client and coordinator diagnostics
 qex config show             the values that qex uses now
 qex schema job|status|pipeline|event    the JSON Schema of each format
+qex describe [--json]        actual commands, arguments and output schemas
 qex completions <shell>     the completions for bash, zsh or fish
 qex help <topic>
 ```
@@ -42,6 +43,25 @@ qex help <topic>
 `ID=$(qex submit ...)` operates correctly. A warning goes to stderr.
 
 Every command that reads data accepts `--json`.
+
+`qex describe --json` reads the Clap command definition without contacting the
+coordinator. It lists command names, option aliases, positional arguments,
+value counts, defaults, conflicts and published output schema names. Read the
+`when` and `shape` fields of each output schema entry. Other output modes have
+no published schema. `protocol_capabilities` names coordinator features;
+`history`, `learn` and `query` in that list are not CLI commands.
+
+| Limit | Explicit name | Older name |
+| --- | --- | --- |
+| Job runtime on submit and run | `--job-timeout TIME` | `--timeout TIME` |
+| Queue admission on submit and run | `--queue-timeout TIME` | `--max-queue-time TIME` |
+| Observation on status, wait and events | `--wait-timeout TIME` | `--timeout TIME` |
+| Observation on submit with `--wait` | `--wait-timeout TIME` | Same name |
+| Each coordinator operation | `--rpc-timeout TIME` | Default: 5m |
+
+The RPC option can appear before or after the command name. Give a positive
+time of at most one day. RPC operations receive separate limits. A long job
+wait keeps its observation limit, and the job keeps its runtime limit.
 
 `qex list` with no option gives the jobs that wait, the jobs that operate, and
 the jobs that stopped in the last hour. It says on stderr how many older jobs it
@@ -630,6 +650,17 @@ A pipeline stage has no dedupe key. A key on one stage would answer for that
 stage alone, and the stages after it would wait for a job of an earlier run.
 
 ## A newer qex
+
+`qex --version` and `qex version --client` work offline. Use
+`qex version --client --json` to read the client version as JSON. These commands
+never contact or start a coordinator.
+
+Plain `qex version` also checks the coordinator without starting it. A missing
+socket gives `coordinator.running: false`. A socket that refuses access or a
+coordinator that gives no reply is unreachable. The command still prints the
+client version and gives socket guidance. JSON reports `running: null` and
+`state: "unreachable"`. The exit code is 124 for a time limit, or 1 for another
+connection fault.
 
 qex looks for a newer release of itself and says one line when it finds one. It
 **never installs anything**: the person who installed qex chose how, and a

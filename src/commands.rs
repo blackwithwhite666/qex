@@ -107,6 +107,14 @@ fn code_for_a_resolver_error(error: &anyhow::Error) -> i32 {
 const AUTO_CLEAN_AGE: u64 = 3600;
 
 pub fn submit(args: cli::SubmitArgs) -> Result<i32> {
+    // Reject a bad observation limit before any path can admit work.
+    let wait_timeout = args
+        .wait_timeout
+        .as_deref()
+        .map(parse_duration)
+        .transpose()
+        .map_err(|e| anyhow::anyhow!("--wait-timeout: {e}"))?
+        .flatten();
     // `--quiet` describes the end of a wait, so it needs a wait. Say so here,
     // and not through a required-argument error of the command line reader:
     // `qex run -q` gave "the argument --wait was not provided" for a command
@@ -224,6 +232,7 @@ pub fn submit(args: cli::SubmitArgs) -> Result<i32> {
                 say_the_id_and_write_the_file(id, args.id_file.as_ref());
                 return wait_after_submit(
                     &id.to_string(),
+                    wait_timeout,
                     args.wait_timeout.as_deref(),
                     args.json,
                     args.quiet,
@@ -319,20 +328,21 @@ fn report_the_record(id: &str, json: bool) {
 ///
 /// One command also closes a race. Between a submission and a wait a short job
 /// can stop, and a `qex clean` in that window deletes the record.
-fn wait_after_submit(raw_id: &str, timeout: Option<&str>, json: bool, quiet: bool) -> Result<i32> {
-    let deadline = match timeout {
-        Some(t) => parse_duration(t)
-            .map_err(|e| anyhow::anyhow!("--wait-timeout: {e}"))?
-            .map(|d| {
-                // THE NUMBER OF THE READER BOUNDS THE WHOLE COMMAND. A reader
-                // who says five seconds must not wait longer while qex reaches
-                // the coordinator: the connect, the lock and the read share
-                // this limit with the wait for the job.
-                crate::client::take_the_limit_of_the_reader(d);
-                Instant::now() + d
-            }),
-        None => None,
-    };
+fn wait_after_submit(
+    raw_id: &str,
+    timeout: Option<Duration>,
+    timeout_text: Option<&str>,
+    json: bool,
+    quiet: bool,
+) -> Result<i32> {
+    let deadline = timeout.map(|d| {
+        // THE NUMBER OF THE READER BOUNDS THE WHOLE COMMAND. A reader
+        // who says five seconds must not wait longer while qex reaches
+        // the coordinator: the connect, the lock and the read share
+        // this limit with the wait for the job.
+        crate::client::take_the_limit_of_the_reader(d);
+        Instant::now() + d
+    });
 
     catch_signals_while_waiting();
     // `--quiet` silences the REPORT and the narration of the queue. It does not
@@ -357,7 +367,7 @@ fn wait_after_submit(raw_id: &str, timeout: Option<&str>, json: bool, quiet: boo
         // and `--quiet` keeps the record away; neither hides the line that
         // carries the id.
         WaitOutcome::TimedOut => {
-            say_that_the_wait_reached_its_limit(&ids, timeout);
+            say_that_the_wait_reached_its_limit(&ids, timeout_text);
             // The reader asked for the record, and the record exists. See
             // `say_that_the_wait_reached_its_limit`.
             if !quiet {
@@ -5542,6 +5552,14 @@ pub fn pipeline(args: cli::PipelineArgs) -> Result<i32> {
 /// that holds an earlier build behaves differently.
 pub fn version(args: cli::VersionArgs) -> Result<i32> {
     let mine = crate::version::VERSION;
+    if args.client {
+        if args.json {
+            println!("{}", serde_json::json!({ "version": mine }));
+        } else {
+            println!("qex {mine}");
+        }
+        return Ok(0);
+    }
 
     // `--check` asks the service NOW. It is the one path in qex that opens a
     // connection from a command of a user, and a person asked for it.
@@ -5565,18 +5583,30 @@ pub fn version(args: cli::VersionArgs) -> Result<i32> {
     // reporting "none" for a coordinator that qex could not reach would answer
     // the question wrongly and exit 0. The limit reaches the reader instead,
     // with the code that says qex stopped waiting.
-    let coordinator = match Client::connect_existing_result()? {
-        Some(mut c) => match c.call(&Request::Info) {
-            Ok(Response::Info {
-                version,
-                pid,
-                program_replaced,
-                ..
-            }) => Some((version, pid, program_replaced)),
-            Err(e) if crate::client::is_a_coordinator_timeout(&e) => return Err(e),
-            _ => None,
-        },
-        None => None,
+    let diagnostic = (|| -> Result<_> {
+        Ok(match Client::connect_existing_result()? {
+            Some(mut c) => match c.call(&Request::Info) {
+                Ok(Response::Info {
+                    version,
+                    pid,
+                    program_replaced,
+                    ..
+                }) => Some((version, pid, program_replaced)),
+                Err(e) => return Err(e),
+                other => bail!("the coordinator gave an unexpected version reply: {other:?}"),
+            },
+            None => {
+                let socket = crate::paths::socket_path()?;
+                if socket.try_exists()? {
+                    bail!("the coordinator socket {} refused the connection. Run `qex info --no-start` to check it. Read the coordinator log before starting work", socket.display());
+                }
+                None
+            }
+        })
+    })();
+    let (coordinator, failure) = match diagnostic {
+        Ok(coordinator) => (coordinator, None),
+        Err(error) => (None, Some(error)),
     };
 
     if args.json {
@@ -5596,6 +5626,15 @@ pub fn version(args: cli::VersionArgs) -> Result<i32> {
                 "coordinator": { "running": false }
             }),
         };
+        if let Some(error) = &failure {
+            value["coordinator"] = serde_json::json!({
+                "running": null,
+                "state": "unreachable",
+                "error": format!("{error:#}"),
+                "socket": crate::paths::socket_path().ok(),
+                "guidance": "Check socket access and run qex info --no-start. Use qex version --client for an offline check.",
+            });
+        }
         // `--check` ADDS to this answer, and it does not replace it. One
         // command gives one shape, so a reader that takes `coordinator` keeps
         // taking it when it asks for the check as well.
@@ -5603,6 +5642,9 @@ pub fn version(args: cli::VersionArgs) -> Result<i32> {
             value["update"] = report.json();
         }
         println!("{}", serde_json::to_string_pretty(&value)?);
+        if let Some(error) = failure {
+            return Err(error);
+        }
         return Ok(if check.as_ref().is_some_and(|r| r.error.is_some()) {
             1
         } else {
@@ -5611,7 +5653,15 @@ pub fn version(args: cli::VersionArgs) -> Result<i32> {
     }
 
     println!("qex {mine}");
-    println!("can do:      {}", crate::capabilities::ALL.join(", "));
+    println!(
+        "protocol capabilities (not CLI commands): {}",
+        crate::capabilities::ALL.join(", ")
+    );
+    if let Some(error) = failure {
+        println!("coordinator: unreachable");
+        println!("Check socket access with `qex info --no-start`. Use `qex version --client` for an offline check.");
+        return Err(error);
+    }
     match coordinator {
         None => println!("coordinator: none operates"),
         Some((version, pid, replaced)) => {
@@ -5625,7 +5675,7 @@ pub fn version(args: cli::VersionArgs) -> Result<i32> {
                     .collect();
                 if !missing.is_empty() {
                     println!(
-                        "cannot do:   {} (this coordinator is older)",
+                        "missing protocol capabilities: {} (this coordinator is older)",
                         missing.iter().map(|s| **s).collect::<Vec<_>>().join(", ")
                     );
                 }

@@ -18520,6 +18520,360 @@ fn a_command_that_asks_about_a_coordinator_does_not_report_absence_for_silence()
     }
 }
 
+#[test]
+fn cli_discovery_and_client_version_work_offline() {
+    let h = Harness::with_default_config("discovery");
+    let run = h.root.join("state/qex/run");
+    std::fs::create_dir_all(&run).unwrap();
+    let _silent = a_socket_that_accepts_and_says_nothing(&run.join("s"));
+    let version = h.qex_within(&["--version"], Duration::from_secs(10));
+    assert!(version.status.success());
+    let client = h.qex_within(&["version", "--client", "--json"], Duration::from_secs(10));
+    assert!(client.status.success());
+    let identity: serde_json::Value = serde_json::from_slice(&client.stdout).unwrap();
+    assert!(
+        String::from_utf8_lossy(&version.stdout).contains(identity["version"].as_str().unwrap())
+    );
+    let output = h.qex_within(&["describe", "--json"], Duration::from_secs(10));
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let description: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let commands = description["cli"]["commands"].as_array().unwrap();
+    for name in ["submit", "status", "wait", "describe", "version"] {
+        assert!(commands.iter().any(|c| c["name"] == name));
+    }
+    for name in [
+        "history",
+        "learn",
+        "query",
+        "daemon",
+        "supervise",
+        "__complete",
+    ] {
+        assert!(!commands.iter().any(|c| c["name"] == name));
+    }
+    assert!(description["protocol_capabilities"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|v| v == "query"));
+    let submit = commands.iter().find(|c| c["name"] == "submit").unwrap();
+    let args = submit["arguments"].as_array().unwrap();
+    let queue = args.iter().find(|a| a["long"] == "max-queue-time").unwrap();
+    assert_eq!(queue["aliases"], serde_json::json!(["queue-timeout"]));
+    assert_eq!(queue["min_values"], 1);
+    assert_eq!(queue["max_values"], 1);
+    let command = args.iter().find(|a| a["id"] == "command").unwrap();
+    assert_eq!(command["positional"], true);
+    assert!(command["max_values"].is_null());
+    for command in commands {
+        assert!(command["arguments"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|a| a["long"] == "rpc-timeout"));
+        for output in command["output_schemas"].as_array().unwrap() {
+            let schema = output["schema"].as_str().unwrap();
+            let text = h.ok(&["schema", schema]);
+            let parsed: serde_json::Value = serde_json::from_str(&text).unwrap();
+            assert!(parsed["$schema"].is_string());
+        }
+    }
+    assert!(!run.join("daemon.log").exists());
+}
+
+#[test]
+fn invalid_options_give_relevant_examples_before_admission() {
+    let h = Harness::with_default_config("optiontips");
+    for (args, example, code) in [
+        (
+            vec!["submit", "--queue-timout", "1s", "--", "true"],
+            "qex submit --cpu",
+            121,
+        ),
+        (
+            vec!["status", "ID", "--queue-timeout", "1s"],
+            "qex status JOB_ID --wait --wait-timeout",
+            121,
+        ),
+        (
+            vec!["--rpc-timeout", "2s", "list", "--bogus"],
+            "qex list --json",
+            2,
+        ),
+        (
+            vec!["--rpc-timeout=2s", "submit", "--bogus"],
+            "qex submit --cpu",
+            121,
+        ),
+    ] {
+        let out = h.qex(&args);
+        let error = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(out.status.code(), Some(code), "{error}");
+        assert!(error.contains(example), "{error}");
+        assert!(!error.contains("'--quiet'"), "{error}");
+    }
+    assert!(!h.root.join("state/qex/run/daemon.log").exists());
+    assert!(!h.root.join("state/qex/jobs").exists());
+}
+
+#[test]
+fn invalid_submit_observation_timeout_never_admits_work() {
+    let h = Harness::with_default_config("badwaitlimit");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let out = h.command_until(
+        h.command(&[
+            "submit",
+            "--wait",
+            "--wait-timeout",
+            "bogus",
+            "--cpu",
+            "1",
+            "--mem",
+            "64MB",
+            "--no-env-capture",
+            "--",
+            "true",
+        ]),
+        "submit with an invalid observation timeout",
+        deadline - STOP_LIMIT,
+    );
+    let error = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(121), "{error}");
+    assert!(
+        error.contains("--wait-timeout: invalid duration"),
+        "{error}"
+    );
+    assert!(error.contains("30s"), "{error}");
+    assert!(out.stdout.is_empty());
+    assert!(!error.contains("qex: job "), "{error}");
+    assert!(!h.root.join("state/qex/jobs").exists());
+    assert!(!h.root.join("state/qex/run/daemon.log").exists());
+}
+
+#[test]
+fn submit_observation_timeout_keeps_unlimited_duration_spellings() {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let h = Harness::with_default_config("unlimitedwait");
+    for timeout in ["0", "none", "never", "unlimited", "0s"] {
+        let out = h.command_until(
+            h.command(&[
+                "submit",
+                "--wait",
+                "--json",
+                "--wait-timeout",
+                timeout,
+                "--",
+                "true",
+            ]),
+            "submit with an unlimited observation timeout",
+            deadline - STOP_LIMIT,
+        );
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let record: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+        assert_eq!(record["state"], "completed");
+    }
+    drop(h);
+    assert!(Instant::now() < deadline);
+}
+
+#[test]
+fn version_keeps_client_identity_when_the_coordinator_is_unreachable() {
+    let h = Harness::with_default_config("versionrefused");
+    let run = h.root.join("state/qex/run");
+    std::fs::create_dir_all(&run).unwrap();
+    let socket = run.join("s");
+    // A stale socket refuses immediately, while a live silent socket reaches the RPC limit.
+    drop(std::os::unix::net::UnixListener::bind(&socket).unwrap());
+    let offline: serde_json::Value =
+        serde_json::from_str(&h.ok(&["version", "--client", "--json"])).unwrap();
+    for json in [false, true] {
+        let args = if json {
+            vec!["version", "--json"]
+        } else {
+            vec!["version"]
+        };
+        let out = h.qex(&args);
+        assert_eq!(out.status.code(), Some(1));
+        let text = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            text.contains(offline["version"].as_str().unwrap()),
+            "{text}"
+        );
+        assert!(text.contains("unreachable"), "{text}");
+        assert!(!text.contains("none operates"), "{text}");
+        if json {
+            let value: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+            assert!(value["coordinator"]["running"].is_null());
+            assert_eq!(value["coordinator"]["socket"], socket.to_str().unwrap());
+        }
+    }
+    std::fs::remove_file(&socket).unwrap();
+    let _silent = a_socket_that_accepts_and_says_nothing(&socket);
+    let out = h.qex_within(
+        &["version", "--json", "--rpc-timeout", "0.2s"],
+        Duration::from_secs(10),
+    );
+    assert_eq!(out.status.code(), Some(124));
+    let value: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(value["version"], offline["version"]);
+    assert_eq!(value["coordinator"]["state"], "unreachable");
+    assert!(value["coordinator"]["error"]
+        .as_str()
+        .unwrap()
+        .contains("--rpc-timeout 0.2s"));
+    assert!(!run.join("daemon.log").exists());
+}
+
+#[test]
+fn rpc_timeout_bounds_operations_without_shortening_job_waits() {
+    let deadline = Instant::now() + Duration::from_secs(60);
+    // Leave time for both harnesses to stop their processes and join the socket worker.
+    let phases_end = deadline - 2 * STOP_LIMIT;
+    let h = Harness::with_default_config("rpclongwait");
+    let out = h.qex_within(
+        &[
+            "submit",
+            "--wait",
+            "--json",
+            "--rpc-timeout",
+            "1s",
+            "--wait-timeout",
+            "30s",
+            "--job-timeout",
+            "20s",
+            "--",
+            "sleep",
+            "3",
+        ],
+        phases_end.saturating_duration_since(Instant::now()),
+    );
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let record: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(record["state"], "completed");
+    assert_eq!(record["exit_code"], 0);
+    let run = h.root.join("state/qex/run");
+    let socket = run.join("s");
+    // Use a separate fixture for a silent RPC, without stopping the real coordinator.
+    let other = Harness::with_default_config("rpcsilent");
+    let other_run = other.root.join("state/qex/run");
+    std::fs::create_dir_all(&other_run).unwrap();
+    let _silent = a_socket_that_accepts_and_says_nothing(&other_run.join("s"));
+    let out = other.qex_within(
+        &["info", "--no-start", "--rpc-timeout", "0.2s"],
+        phases_end.saturating_duration_since(Instant::now()),
+    );
+    assert_eq!(out.status.code(), Some(124));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("--rpc-timeout 0.2s"));
+    assert!(socket.exists());
+    drop(_silent);
+    drop(other);
+    drop(h);
+    assert!(Instant::now() < deadline);
+}
+
+#[test]
+fn rpc_timeout_also_bounds_the_wait_for_a_new_coordinator() {
+    let h = Harness::with_default_config("rpcstartup");
+    // The CLI can start, but this config prevents the daemon from binding its socket.
+    h.write_config("[budget]\ncpu = \"invalid\"\n");
+    let started = Instant::now();
+    let out = h.qex_within(&["list", "--rpc-timeout", "0.2s"], Duration::from_secs(10));
+    assert_eq!(
+        out.status.code(),
+        Some(124),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(started.elapsed() < Duration::from_secs(5));
+    let error = String::from_utf8_lossy(&out.stderr);
+    assert!(error.contains("--rpc-timeout 0.2s"), "{error}");
+    assert!(error.contains("log file"), "{error}");
+}
+
+#[test]
+fn timeout_aliases_keep_job_queue_and_observation_limits_separate() {
+    let deadline = Instant::now() + Duration::from_secs(60);
+    let phases_end = deadline - STOP_LIMIT;
+    let h = Harness::new("timeoutaliases", ABORT_CONFIG);
+    let run =
+        |args: &[&str]| h.qex_within(args, phases_end.saturating_duration_since(Instant::now()));
+    let submit = |args: &[&str]| {
+        let out = run(args);
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let id = String::from_utf8(out.stdout).unwrap().trim().to_string();
+        assert!(id.parse::<uuid::Uuid>().is_ok(), "{id}");
+        id
+    };
+    let id = submit(&["submit", "--job-timeout", "1s", "--", "sleep", "30"]);
+    let out = run(&["wait", &id, "--wait-timeout", "20s", "--json"]);
+    assert_eq!(out.status.code(), Some(125));
+    let record: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(record[0]["state"], "timeout");
+    let holder = submit(&["submit", "--cpu", "1", "--mem", "64MB", "--", "sleep", "30"]);
+    loop {
+        let out = run(&["status", &holder, "--json"]);
+        assert!(out.status.success());
+        let record: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+        if record["state"] == "running" {
+            break;
+        }
+        assert!(
+            Instant::now() < phases_end,
+            "the holder did not start: {record}"
+        );
+        std::thread::sleep(
+            Duration::from_millis(200).min(phases_end.saturating_duration_since(Instant::now())),
+        );
+    }
+    let queued = submit(&[
+        "submit",
+        "--cpu",
+        "1",
+        "--mem",
+        "64MB",
+        "--queue-timeout",
+        "1s",
+        "--",
+        "true",
+    ]);
+    let out = run(&[
+        "status",
+        &holder,
+        "--wait",
+        "--wait-timeout",
+        "0.1s",
+        "--json",
+    ]);
+    assert_eq!(out.status.code(), Some(124));
+    let out = run(&["status", &holder, "--json"]);
+    let record: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(record["state"], "running");
+    let out = run(&["wait", &queued, "--timeout", "20s", "--json"]);
+    assert_eq!(out.status.code(), Some(123));
+    let record: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(record[0]["state"], "expired");
+    let out = run(&["kill", &holder]);
+    assert!(out.status.success());
+    drop(h);
+    assert!(Instant::now() < deadline);
+}
+
 // ---------------------------------------------------------------------------
 // qex abort
 // ---------------------------------------------------------------------------
