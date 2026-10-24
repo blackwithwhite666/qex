@@ -107,6 +107,14 @@ fn code_for_a_resolver_error(error: &anyhow::Error) -> i32 {
 const AUTO_CLEAN_AGE: u64 = 3600;
 
 pub fn submit(args: cli::SubmitArgs) -> Result<i32> {
+    // Reject a bad observation limit before any path can admit work.
+    let wait_timeout = args
+        .wait_timeout
+        .as_deref()
+        .map(parse_duration)
+        .transpose()
+        .map_err(|e| anyhow::anyhow!("--wait-timeout: {e}"))?
+        .flatten();
     // `--quiet` describes the end of a wait, so it needs a wait. Say so here,
     // and not through a required-argument error of the command line reader:
     // `qex run -q` gave "the argument --wait was not provided" for a command
@@ -224,6 +232,7 @@ pub fn submit(args: cli::SubmitArgs) -> Result<i32> {
                 say_the_id_and_write_the_file(id, args.id_file.as_ref());
                 return wait_after_submit(
                     &id.to_string(),
+                    wait_timeout,
                     args.wait_timeout.as_deref(),
                     args.json,
                     args.quiet,
@@ -319,20 +328,21 @@ fn report_the_record(id: &str, json: bool) {
 ///
 /// One command also closes a race. Between a submission and a wait a short job
 /// can stop, and a `qex clean` in that window deletes the record.
-fn wait_after_submit(raw_id: &str, timeout: Option<&str>, json: bool, quiet: bool) -> Result<i32> {
-    let deadline = match timeout {
-        Some(t) => parse_duration(t)
-            .map_err(|e| anyhow::anyhow!("--wait-timeout: {e}"))?
-            .map(|d| {
-                // THE NUMBER OF THE READER BOUNDS THE WHOLE COMMAND. A reader
-                // who says five seconds must not wait longer while qex reaches
-                // the coordinator: the connect, the lock and the read share
-                // this limit with the wait for the job.
-                crate::client::take_the_limit_of_the_reader(d);
-                Instant::now() + d
-            }),
-        None => None,
-    };
+fn wait_after_submit(
+    raw_id: &str,
+    timeout: Option<Duration>,
+    timeout_text: Option<&str>,
+    json: bool,
+    quiet: bool,
+) -> Result<i32> {
+    let deadline = timeout.map(|d| {
+        // THE NUMBER OF THE READER BOUNDS THE WHOLE COMMAND. A reader
+        // who says five seconds must not wait longer while qex reaches
+        // the coordinator: the connect, the lock and the read share
+        // this limit with the wait for the job.
+        crate::client::take_the_limit_of_the_reader(d);
+        Instant::now() + d
+    });
 
     catch_signals_while_waiting();
     // `--quiet` silences the REPORT and the narration of the queue. It does not
@@ -357,7 +367,7 @@ fn wait_after_submit(raw_id: &str, timeout: Option<&str>, json: bool, quiet: boo
         // and `--quiet` keeps the record away; neither hides the line that
         // carries the id.
         WaitOutcome::TimedOut => {
-            say_that_the_wait_reached_its_limit(&ids, timeout);
+            say_that_the_wait_reached_its_limit(&ids, timeout_text);
             // The reader asked for the record, and the record exists. See
             // `say_that_the_wait_reached_its_limit`.
             if !quiet {

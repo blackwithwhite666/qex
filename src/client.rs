@@ -669,11 +669,6 @@ impl Client {
         // A caller that set its own limit keeps it. `qex logs --follow` and the
         // reporter of a wait each hold a limit that belongs to their own work.
         let previous_timeout = self.stream.read_timeout().ok().flatten();
-        if previous_timeout
-            .is_some_and(|time| time <= deadline.saturating_duration_since(Instant::now()))
-        {
-            return self.recv();
-        }
 
         // THIS WAIT STARTS NOW. The ceiling answers one question — has qex
         // waited too long for THIS answer — so nothing that the command did
@@ -689,7 +684,14 @@ impl Client {
             // takes the first part of a line and loses that part, so a large
             // answer that crosses a step would misparse. This call reads
             // nothing, so a step can never divide an answer.
-            match self.wait_readable(left.min(step_of_a_wait())) {
+            let step = left.min(step_of_a_wait());
+            let poll_for = previous_timeout.map_or(step, |time| time.min(step));
+            let readable = if self.reader.buffer().is_empty() {
+                self.wait_readable(poll_for)
+            } else {
+                Ok(true)
+            };
+            match readable {
                 // READABLE IS NOT ANSWERED.
                 //
                 // The socket reports the FIRST BYTE, and an answer is a whole
@@ -702,12 +704,7 @@ impl Client {
                 // ends thus reaches the same limit as an answer that never
                 // starts.
                 Ok(true) => {
-                    let left = deadline.saturating_duration_since(Instant::now());
-                    if left.is_zero() {
-                        break Err(timed_out(a_silent_coordinator(started.elapsed())));
-                    }
-                    self.set_read_timeout(Some(left)).ok();
-                    let got = self.recv();
+                    let got = self.recv_within(deadline, previous_timeout);
                     self.set_read_timeout(previous_timeout).ok();
                     // A read that reached the limit took the first part of a
                     // line and lost it, so this connection can no longer say
@@ -719,6 +716,9 @@ impl Client {
                         }
                         other => other,
                     };
+                }
+                Ok(false) if previous_timeout.is_some_and(|time| time <= step) => {
+                    break Err(timed_out(a_silent_coordinator(started.elapsed())));
                 }
                 Ok(false) => {
                     // The answer did not arrive YET. The coordinator can be
@@ -739,6 +739,43 @@ impl Client {
             self.lost_its_place = true;
         }
         answer
+    }
+
+    /// Keep one deadline while a reply arrives in several fragments.
+    fn recv_within(
+        &mut self,
+        deadline: Instant,
+        socket_timeout: Option<Duration>,
+    ) -> Result<Response> {
+        let mut line = Vec::new();
+        loop {
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                return Err(std::io::Error::from(std::io::ErrorKind::TimedOut).into());
+            }
+            // A socket timeout limits each read. Recompute it before each fill,
+            // or a peer that keeps sending bytes can hold this call forever.
+            self.set_read_timeout(Some(socket_timeout.map_or(left, |time| time.min(left))))?;
+            let bytes = self
+                .reader
+                .fill_buf()
+                .context("reading the answer of the coordinator")?;
+            let end = bytes.iter().position(|&byte| byte == b'\n');
+            let count = end.map_or(bytes.len(), |i| i + 1);
+            line.extend_from_slice(&bytes[..count]);
+            self.reader.consume(count);
+            if end.is_some() || count == 0 {
+                if line.is_empty() {
+                    bail!("the coordinator closed the connection without an answer");
+                }
+                return serde_json::from_slice(&line).with_context(|| {
+                    format!(
+                        "reading this answer of the coordinator: {}",
+                        String::from_utf8_lossy(&line).trim()
+                    )
+                });
+            }
+        }
     }
 
     pub fn send(&mut self, request: &Request) -> Result<()> {
@@ -1605,6 +1642,80 @@ mod tests {
             said.contains("question that you did not ask"),
             "the fault must say what it prevented: {said}"
         );
+    }
+
+    #[test]
+    fn an_rpc_deadline_bounds_fragmented_replies_and_keeps_alignment() {
+        for socket_timeout in [None, Some(Duration::from_millis(80))] {
+            let (ours, mut theirs) = UnixStream::pair().unwrap();
+            let mut client = Client::with_stream(ours).unwrap();
+            client.set_read_timeout(socket_timeout).unwrap();
+            let (stop, stopped) = std::sync::mpsc::channel();
+            let worker = std::thread::spawn(move || {
+                for _ in 0..60 {
+                    if theirs.write_all(b" ").is_err() {
+                        return;
+                    }
+                    if !matches!(
+                        stopped.recv_timeout(Duration::from_millis(10)),
+                        Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+                    ) {
+                        return;
+                    }
+                }
+                let _ = theirs.write_all(b"{\"result\":\"capabilities\",\"names\":[]}\n");
+            });
+            let start = Instant::now();
+            let answer = client.call_within(&Request::Info, start + Duration::from_millis(100));
+            let elapsed = start.elapsed();
+            let _ = stop.send(());
+            worker.join().unwrap();
+            assert!(is_a_coordinator_timeout(&answer.unwrap_err()));
+            assert!(elapsed < Duration::from_millis(400), "{elapsed:?}");
+            assert_eq!(client.stream.read_timeout().unwrap(), socket_timeout);
+            assert!(client.lost_its_place);
+            let error = client
+                .call_within(&Request::Info, Instant::now() + Duration::from_secs(1))
+                .unwrap_err();
+            assert!(error
+                .to_string()
+                .contains("asked the coordinator nothing more"));
+        }
+    }
+
+    #[test]
+    fn an_rpc_call_keeps_a_tighter_socket_timeout() {
+        let (ours, _theirs) = UnixStream::pair().unwrap();
+        let mut client = Client::with_stream(ours).unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_millis(50)))
+            .unwrap();
+        let start = Instant::now();
+        let answer = client.call_within(&Request::Info, start + Duration::from_secs(2));
+        assert!(answer.is_err());
+        assert!(start.elapsed() < Duration::from_secs(1));
+        assert_eq!(
+            client.stream.read_timeout().unwrap(),
+            Some(Duration::from_millis(50))
+        );
+        assert!(client.lost_its_place);
+    }
+
+    #[test]
+    fn an_rpc_call_accumulates_a_complete_fragmented_reply() {
+        let (ours, mut theirs) = UnixStream::pair().unwrap();
+        let mut client = Client::with_stream(ours).unwrap();
+        let worker = std::thread::spawn(move || {
+            theirs.write_all(b"{\"result\":\"capabilities\",").unwrap();
+            std::thread::sleep(Duration::from_millis(30));
+            theirs.write_all(b"\"names\":[\"fragmented\"]}\n").unwrap();
+        });
+        let answer = client.call_within(&Request::Info, Instant::now() + Duration::from_secs(1));
+        worker.join().unwrap();
+        assert!(
+            matches!(answer.unwrap(), Response::Capabilities { names } if names == ["fragmented"])
+        );
+        assert!(!client.lost_its_place);
     }
 
     #[test]
