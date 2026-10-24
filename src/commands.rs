@@ -115,6 +115,22 @@ pub fn submit(args: cli::SubmitArgs) -> Result<i32> {
         .transpose()
         .map_err(|e| anyhow::anyhow!("--wait-timeout: {e}"))?
         .flatten();
+    check_result_options(&args.result, args.json)?;
+    if !args.result.agent && (!args.result.fields.is_empty() || args.result.max_bytes.is_some()) {
+        bail!("submit --fields and --max-bytes need --agent; example: qex submit --agent --fields id,state -- COMMAND");
+    }
+    if args.result.agent && (args.follow || args.each_line.is_some()) {
+        bail!("--agent takes one recorded job; use qex submit --agent -- COMMAND");
+    }
+    if args.wait_timeout.is_some() && !args.wait && !args.result.agent {
+        bail!("--wait-timeout needs --wait or --agent");
+    }
+    // Validate the profile's observation override before admission.
+    let agent_limit = if args.result.agent {
+        Some(result_wait_limit(args.wait_timeout.as_deref())?)
+    } else {
+        None
+    };
     // `--quiet` describes the end of a wait, so it needs a wait. Say so here,
     // and not through a required-argument error of the command line reader:
     // `qex run -q` gave "the argument --wait was not provided" for a command
@@ -149,8 +165,13 @@ pub fn submit(args: cli::SubmitArgs) -> Result<i32> {
         return submit_each_line(args);
     }
 
-    let cfg = Config::load()?;
+    let mut cfg = Config::load()?;
     cfg.validate()?;
+
+    // A profile changes only the fallback: CLI and job-file choices still win.
+    if args.result.agent {
+        cfg.submit.env_capture = EnvCapture::Minimal;
+    }
 
     let env_capture = if args.no_env_capture {
         Some(EnvCapture::None)
@@ -220,6 +241,18 @@ pub fn submit(args: cli::SubmitArgs) -> Result<i32> {
             // way in both cases. The difference belongs on the other stream.
             if let Some(text) = warning {
                 eprintln!("qex: {text}");
+            }
+            if let Some(limit) = agent_limit {
+                say_the_id_and_write_the_file(id, args.id_file.as_ref());
+                return observe_results(
+                    &[id.to_string()],
+                    true,
+                    Some(&limit),
+                    &args.result,
+                    true,
+                    None,
+                    Some(deduplicated),
+                );
             }
             // With `--wait`, stdout carries the RESULT of the job, so the id
             // goes to stderr. Two answers on one stream would give
@@ -295,7 +328,8 @@ fn say_the_id_and_write_the_file(id: uuid::Uuid, path: Option<&std::path::PathBu
 /// one job four ways.
 fn report_the_record(id: &str, json: bool) {
     let args = cli::StatusArgs {
-        id: id.to_string(),
+        ids: vec![id.to_string()],
+        result: cli::ResultArgs::default(),
         json,
         show_env: false,
         no_logs: false,
@@ -912,7 +946,428 @@ pub fn list(args: cli::ListArgs) -> Result<i32> {
     Ok(0)
 }
 
+fn check_result_options(options: &cli::ResultArgs, json: bool) -> Result<()> {
+    if !options.agent && !json && (!options.fields.is_empty() || options.max_bytes.is_some()) {
+        bail!("--fields and --max-bytes need --agent or --json");
+    }
+    Ok(())
+}
+
+fn result_wait_limit(limit: Option<&str>) -> Result<String> {
+    let limit = limit.unwrap_or("10m");
+    if parse_duration(limit)
+        .map_err(|e| anyhow::anyhow!("--wait-timeout: {e}"))?
+        .is_none()
+    {
+        bail!("--agent needs a bounded observation; use --wait-timeout 10m");
+    }
+    Ok(limit.to_string())
+}
+
+fn select_result_fields(value: &mut serde_json::Value, options: &cli::ResultArgs, agent: bool) {
+    if !options.fields.is_empty() {
+        let read_error = matches!(value["observation"].as_str(), Some("missing" | "error"));
+        if let Some(object) = value.as_object_mut() {
+            object.retain(|key, _| {
+                options.fields.contains(key)
+                    || key == "id"
+                    || (agent && matches!(key.as_str(), "observation" | "logs_truncated"))
+                    || key == "observation"
+                    || (read_error && key == "error")
+            });
+        }
+    }
+}
+
+/// Bound the serialized response, including escaping and the final newline.
+/// Only log text can be removed. Every job and all selected metadata remain.
+fn write_result_json(
+    value: &mut serde_json::Value,
+    options: &cli::ResultArgs,
+    compact: bool,
+) -> Result<()> {
+    let limit = options
+        .max_bytes
+        .or(options.agent.then_some(16384))
+        .map(|n| n as usize);
+    loop {
+        let text = if compact {
+            serde_json::to_string(value)?
+        } else {
+            serde_json::to_string_pretty(value)?
+        };
+        if limit.is_none_or(|limit| text.len() < limit) {
+            println!("{text}");
+            return Ok(());
+        }
+        let rows: Vec<&mut serde_json::Value> = if compact {
+            value["results"]
+                .as_array_mut()
+                .unwrap()
+                .iter_mut()
+                .collect()
+        } else if value.is_array() {
+            value.as_array_mut().unwrap().iter_mut().collect()
+        } else {
+            vec![value]
+        };
+        let mut shortened = false;
+        for row in rows {
+            let mut cut = false;
+            if let Some(logs) = row.get_mut("logs").and_then(|v| v.as_object_mut()) {
+                for log in logs.values_mut() {
+                    if let Some(text) = log.get_mut("text") {
+                        if let Some(old) = text.as_str() {
+                            if !old.is_empty() {
+                                let mut at = old.len().div_ceil(2);
+                                while !old.is_char_boundary(at) {
+                                    at += 1;
+                                }
+                                *text = serde_json::json!(&old[at..]);
+                                cut = true;
+                            }
+                        }
+                    }
+                }
+            }
+            if cut {
+                row["logs_truncated"] = true.into();
+                shortened = true;
+            }
+        }
+        if !shortened {
+            bail!("--max-bytes is too small for the selected metadata; increase it or select fewer --fields (no jobs were omitted)");
+        }
+    }
+}
+
+/// A bounded projection over native resolution, status and wait. No new service
+/// or persistent reader state: each target keeps its own explicit read outcome.
+fn observe_results(
+    raws: &[String],
+    waiting: bool,
+    timeout: Option<&str>,
+    options: &cli::ResultArgs,
+    agent: bool,
+    status_args: Option<&cli::StatusArgs>,
+    deduplicated: Option<bool>,
+) -> Result<i32> {
+    // Use the native disk resolver, but retain a corrupt/unreadable record as
+    // an error. The legacy wait helper intentionally treats it as not ready.
+    let read_record = |raw: &str| -> Result<Option<JobStatus>> {
+        find_id_on_disk(raw)?
+            .map(|id| crate::job::read_status(&paths::job_dir(&id)?))
+            .transpose()
+    };
+    let limit = if agent && waiting {
+        Some(result_wait_limit(timeout)?)
+    } else {
+        timeout.map(str::to_string)
+    };
+    let duration = limit
+        .as_deref()
+        .map(parse_duration)
+        .transpose()
+        .map_err(anyhow::Error::msg)?
+        .flatten();
+    let deadline = duration.map(|d| {
+        crate::client::take_the_limit_of_the_reader(d);
+        Instant::now() + d
+    });
+    if waiting {
+        catch_signals_while_waiting();
+    }
+
+    let mut client = None;
+    let connection = if waiting {
+        Client::connect_existing_interruptible(wait_was_interrupted)
+    } else {
+        Client::connect_existing_result()
+    };
+    let resolved = connection.and_then(|connection| {
+        client = connection;
+        client.as_mut().map(|c| resolve_many(c, raws)).transpose()
+    });
+    let mut targets: Vec<(String, Option<JobStatus>, Option<String>, &'static str)> = Vec::new();
+    match resolved {
+        Ok(Some(answers)) => {
+            for (raw, answer) in raws.iter().zip(answers) {
+                match answer {
+                    Ok(found) => {
+                        for id in found.ids {
+                            let id = id.to_string();
+                            if !targets.iter().any(|t| t.0 == id) {
+                                targets.push((id, None, None, "snapshot"));
+                            }
+                        }
+                    }
+                    Err(error) => {
+                        let observation = if code_for_a_resolver_error(&error) == EXIT_NO_SUCH_JOB {
+                            "missing"
+                        } else {
+                            "error"
+                        };
+                        targets.push((raw.clone(), None, Some(error.to_string()), observation));
+                    }
+                }
+            }
+        }
+        // A failed transport is never proof of a missing target. Exact on-disk
+        // records still work after a coordinator exits.
+        other => {
+            client = None;
+            let transport = other.err().map(|e| format!("{e:#}"));
+            for raw in raws {
+                match read_record(raw) {
+                    Ok(Some(s)) => targets.push((s.id.to_string(), Some(s), None, "snapshot")),
+                    Ok(None) => targets.push((
+                        raw.clone(),
+                        None,
+                        Some(transport.clone().unwrap_or_else(|| {
+                            "no record or coordinator can resolve this target".into()
+                        })),
+                        if transport.is_some() {
+                            "error"
+                        } else {
+                            "missing"
+                        },
+                    )),
+                    Err(e) => targets.push((raw.clone(), None, Some(e.to_string()), "error")),
+                }
+            }
+        }
+    }
+
+    let mut wait_fault =
+        (waiting && wait_was_interrupted()).then_some(("interrupted", EXIT_WAIT_BROKEN));
+    let mut job_code = 0;
+    for (id, record, error, observation) in &mut targets {
+        if error.is_some() {
+            continue;
+        }
+        if waiting && wait_fault.is_none() {
+            let mut reporter = ReasonReporter::new(true);
+            match wait_one(id, deadline, &mut reporter) {
+                Ok(WaitOutcome::Finished(s)) => {
+                    *record = Some(*s);
+                    *observation = "complete";
+                }
+                Ok(WaitOutcome::TimedOut) => {
+                    wait_fault = Some(("timeout", EXIT_TIMEOUT));
+                }
+                Ok(WaitOutcome::Interrupted) => {
+                    wait_fault = Some(("interrupted", EXIT_WAIT_BROKEN));
+                }
+                Ok(WaitOutcome::NoSuchJob) => {
+                    *error = Some("the job record no longer exists".into());
+                    *observation = "missing";
+                }
+                Err(e) => {
+                    *error = Some(e.to_string());
+                    *observation = "error";
+                }
+            }
+        }
+        if error.is_some() {
+            continue;
+        }
+        if *observation != "complete" {
+            // After a spent wait, use the durable record without giving each
+            // remaining target a fresh coordinator deadline.
+            let read = if wait_fault.is_some() || deadline.is_some_and(|d| Instant::now() >= d) {
+                read_record(id)
+            } else if let Some(c) = &mut client {
+                match c.call(&Request::Status { id: id.parse()? }) {
+                    Ok(Response::Status { status }) => Ok(Some(*status)),
+                    Ok(Response::Error {
+                        kind: ErrorKind::NoSuchJob,
+                        message,
+                        ..
+                    }) => {
+                        *observation = "missing";
+                        Err(anyhow::anyhow!(message))
+                    }
+                    other => Err(anyhow::anyhow!("status read failed: {other:?}")),
+                }
+            } else {
+                read_record(id)
+            };
+            match read {
+                Ok(Some(s)) => *record = Some(s),
+                Ok(None) => {
+                    *error = Some("the job record is unavailable".into());
+                    *observation = "error";
+                }
+                Err(e) => {
+                    *error = Some(e.to_string());
+                    if *observation != "missing" {
+                        *observation = "error";
+                    }
+                }
+            }
+        }
+        if let Some(s) = record {
+            if s.state.is_terminal() {
+                *observation = "complete";
+                if job_code == 0 {
+                    job_code = exit_code_for(s);
+                }
+            } else if let Some((outcome, _)) = wait_fault {
+                *observation = outcome;
+            }
+        }
+    }
+
+    let partial = targets.iter().any(|t| t.2.is_some());
+    let overall = wait_fault.map(|v| v.0).unwrap_or_else(|| {
+        if partial {
+            "partial"
+        } else if targets.iter().all(|t| t.3 == "complete") {
+            "complete"
+        } else {
+            "snapshot"
+        }
+    });
+    let defaults = cli::StatusArgs {
+        ids: Vec::new(),
+        result: cli::ResultArgs::default(),
+        json: true,
+        show_env: false,
+        no_logs: false,
+        wait: false,
+        follow: false,
+        quiet: false,
+        timeout: None,
+        select: crate::logsel::LogSelect {
+            tail: Some(20),
+            ..Default::default()
+        },
+    };
+    let mut rows = Vec::new();
+    for (id, record, error, observation) in &targets {
+        let mut row = if let Some(s) = record {
+            let s = for_display(s.clone());
+            let mut row = serde_json::to_value(&s)?;
+            if agent {
+                row["resources"] = serde_json::json!({"cpu":s.cpu, "mem":s.mem, "cpu_source":s.cpu_source, "mem_source":s.mem_source});
+            }
+            let log_args = status_args.unwrap_or(&defaults);
+            if options.fields.is_empty() || options.fields.iter().any(|f| f == "logs") {
+                let mut log_defaults = log_args.clone();
+                if agent && !log_defaults.select.is_explicit() {
+                    log_defaults.select.tail = Some(20);
+                }
+                let mut logs = serde_json::Map::new();
+                for (stream, excerpt) in job_excerpt(&s, &log_defaults)? {
+                    logs.insert(
+                        stream,
+                        serde_json::json!({"text":excerpt.text, "hidden_lines":excerpt.hidden}),
+                    );
+                }
+                row["logs"] = logs.into();
+            }
+            if options.fields.iter().any(|f| f == "env") {
+                let spec = crate::job::read_spec(&paths::job_dir(&s.id)?)?;
+                row["env"] = serde_json::to_value(
+                    spec.env
+                        .iter()
+                        .map(|(k, v)| (crate::job::visible(k), crate::job::visible(v)))
+                        .collect::<std::collections::BTreeMap<_, _>>(),
+                )?;
+            }
+            row
+        } else {
+            serde_json::json!({"id":id, "state":null, "exit_code":null, "signal":null, "blocked_reason":null, "logs":{}})
+        };
+        row["observation"] = (*observation).into();
+        if let Some(error) = error {
+            row["error"] = error.clone().into();
+        }
+        if agent {
+            row["deduplicated"] = serde_json::json!(deduplicated);
+            row["logs_truncated"] = false.into();
+            row["continuation"] = if record.as_ref().is_some_and(|s| !s.state.is_terminal()) {
+                serde_json::json!([
+                    "qex",
+                    "status",
+                    id,
+                    "--agent",
+                    "--wait",
+                    "--wait-timeout",
+                    limit.as_deref().unwrap_or("10m")
+                ])
+            } else {
+                serde_json::json!([])
+            };
+            if options.fields.is_empty() {
+                row.as_object_mut().unwrap().retain(|key, _| {
+                    matches!(
+                        key.as_str(),
+                        "id" | "state"
+                            | "exit_code"
+                            | "signal"
+                            | "observation"
+                            | "blocked_reason"
+                            | "logs"
+                            | "logs_truncated"
+                            | "continuation"
+                            | "deduplicated"
+                            | "error"
+                            | "resources"
+                    )
+                });
+            }
+        }
+        select_result_fields(&mut row, options, agent);
+        rows.push(row);
+    }
+    let mut value = if agent {
+        serde_json::json!({"version":1,"observation":overall,"results":rows})
+    } else {
+        serde_json::json!(rows)
+    };
+    write_result_json(&mut value, options, agent)?;
+    Ok(wait_fault.map(|v| v.1).unwrap_or_else(|| {
+        if partial {
+            if targets.iter().any(|t| t.3 == "missing") {
+                EXIT_NO_SUCH_JOB
+            } else {
+                1
+            }
+        } else if waiting {
+            job_code
+        } else {
+            0
+        }
+    }))
+}
+
 pub fn status(args: cli::StatusArgs) -> Result<i32> {
+    check_result_options(&args.result, args.json)?;
+    if args.result.agent || args.ids.len() > 1 {
+        if args.follow || args.quiet || args.show_env {
+            bail!("batch/agent status uses recorded output; use --fields env for explicit agent environment output, or one legacy status target");
+        }
+        if !args.json && !args.result.agent {
+            bail!("batch status needs --json; example: qex status ID ID --json");
+        }
+        if args.timeout.is_some() && !args.wait {
+            bail!("--wait-timeout needs --wait; example: qex status ID --agent --wait --wait-timeout 10m");
+        }
+        args.select
+            .apply("", crate::logsel::STATUS_LINES)
+            .map_err(anyhow::Error::msg)?;
+        return observe_results(
+            &args.ids,
+            args.wait,
+            args.timeout.as_deref(),
+            &args.result,
+            args.result.agent,
+            Some(&args),
+            None,
+        );
+    }
+    let raw_id = &args.ids[0];
     // TAKE THE LIMIT OF THE READER BEFORE THE FIRST CONNECT.
     //
     // A command that connects, resolves an id, and only then reads `--timeout`
@@ -928,7 +1383,7 @@ pub fn status(args: cli::StatusArgs) -> Result<i32> {
     // name that is not a UUID gives the code 1 and a UUID gives the code 127,
     // for the same fault. A script cannot use two codes for one condition.
     // A pipeline gives every one of its stages, in the order of submission.
-    let found = match resolve_targets(&mut client, &args.id) {
+    let found = match resolve_targets(&mut client, raw_id) {
         Ok(found) => found,
         Err(e) => {
             eprintln!("qex: {e}");
@@ -982,7 +1437,7 @@ pub fn status(args: cli::StatusArgs) -> Result<i32> {
         if ids.len() != 1 {
             bail!(
                 "`--follow` takes one job, and `{}` gives {}. Name the stage that you want.",
-                args.id,
+                raw_id,
                 ids.len()
             );
         }
@@ -1162,6 +1617,7 @@ pub fn status(args: cli::StatusArgs) -> Result<i32> {
                 }
                 value["logs"] = serde_json::Value::Object(logs);
             }
+            select_result_fields(&mut value, &args.result, false);
             values.push(value);
         } else {
             if n > 0 {
@@ -1192,9 +1648,9 @@ pub fn status(args: cli::StatusArgs) -> Result<i32> {
         // that reads `.[0]` of a group breaks on the day a pipeline has one
         // stage, or on the day `qex clean` removes all the stages but one.
         if is_pipeline {
-            println!("{}", serde_json::to_string_pretty(&values)?);
+            write_result_json(&mut serde_json::json!(values), &args.result, false)?;
         } else {
-            println!("{}", serde_json::to_string_pretty(&values[0])?);
+            write_result_json(&mut values[0], &args.result, false)?;
         }
     }
 
@@ -1592,6 +2048,24 @@ fn print_status(s: &JobStatus, show_env: bool) -> Result<()> {
 /// This command replaces a monitor script. It does not poll. The coordinator
 /// does not answer until the job stops.
 pub fn wait(args: cli::WaitArgs) -> Result<i32> {
+    check_result_options(&args.result, args.json)?;
+    if args.next && (!args.result.fields.is_empty() || args.result.max_bytes.is_some()) {
+        bail!("--next does not accept --fields or --max-bytes; use qex wait ID --agent for bounded records");
+    }
+    if args.result.agent {
+        if args.next {
+            bail!("--agent does not accept --next; use qex wait ID --agent --wait-timeout 10m");
+        }
+        return observe_results(
+            &args.ids,
+            true,
+            args.timeout.as_deref(),
+            &args.result,
+            true,
+            None,
+            None,
+        );
+    }
     let deadline = match &args.timeout {
         Some(t) => parse_duration(t)
             .map_err(|e| anyhow::anyhow!("--timeout: {e}"))?
@@ -1702,7 +2176,11 @@ pub fn wait(args: cli::WaitArgs) -> Result<i32> {
     if args.quiet {
         // The exit code and nothing else.
     } else if args.json {
-        println!("{}", serde_json::to_string_pretty(&results)?);
+        let mut value = serde_json::to_value(&results)?;
+        for row in value.as_array_mut().unwrap() {
+            select_result_fields(row, &args.result, false);
+        }
+        write_result_json(&mut value, &args.result, false)?;
     } else {
         // ONE LINE for each job. This command takes many jobs, so it gives a
         // short report of each. Use `qex status $ID --wait` for the record of
@@ -2115,6 +2593,9 @@ fn wait_one_until(
     reporter: &mut ReasonReporter,
 ) -> Result<WaitOutcome> {
     loop {
+        if wait_was_interrupted() {
+            return Ok(WaitOutcome::Interrupted);
+        }
         // THE LIMIT CAN PASS BEFORE THIS WAIT BEGINS. It spans the command, so
         // the wait for an earlier job, or a slow connect, can use all of it.
         // qex then reaches no coordinator, because every operation refuses to
@@ -2209,7 +2690,11 @@ fn reconnect(raw_id: &str, deadline: Option<Instant>) -> Reconnect {
                 return Reconnect::Finished(Box::new(status));
             }
         }
-        if Client::connect_existing().is_some() {
+        if Client::connect_existing_interruptible(wait_was_interrupted)
+            .ok()
+            .flatten()
+            .is_some()
+        {
             return Reconnect::Ready;
         }
         if Instant::now() >= limit {
@@ -2252,7 +2737,13 @@ fn wait_through_coordinator(
     // caller would tell the reader about a coordinator that is fine.
     let the_limit_passed = || deadline.is_some_and(|d| Instant::now() >= d);
 
-    let Some(mut client) = Client::connect_existing() else {
+    let Some(mut client) = Client::connect_existing_interruptible(wait_was_interrupted)
+        .ok()
+        .flatten()
+    else {
+        if wait_was_interrupted() {
+            return Ok(Some(WaitOutcome::Interrupted));
+        }
         if the_limit_passed() {
             return Ok(Some(WaitOutcome::TimedOut));
         }
@@ -2278,6 +2769,7 @@ fn wait_through_coordinator(
     let id = match resolve_id_for_wait(&mut client, raw_id) {
         Ok(Some(id)) => id,
         Ok(None) => return Ok(Some(WaitOutcome::NoSuchJob)),
+        Err(_) if wait_was_interrupted() => return Ok(Some(WaitOutcome::Interrupted)),
         Err(_) if the_limit_passed() => return Ok(Some(WaitOutcome::TimedOut)),
         // The coordinator did not answer. Find the answer without it.
         Err(_) => return Ok(None),
@@ -2318,7 +2810,7 @@ fn wait_through_coordinator(
         }
     }
 
-    match client.recv() {
+    match client.recv_until(deadline) {
         Ok(Response::Status { status }) => Ok(Some(WaitOutcome::Finished(status))),
         Ok(Response::Error {
             kind: ErrorKind::NoSuchJob,
@@ -2328,9 +2820,9 @@ fn wait_through_coordinator(
         // the coordinator, and a second line here would say the same thing
         // twice in different words.
         Ok(other) => bail!("the coordinator gave an answer that qex did not expect: {other:?}"),
-        // The coordinator closed the connection, or the read failed. Both mean
-        // that the coordinator stopped: the deadline above ends a wait that
-        // reached its time limit, so a fault here is not a time limit.
+        Err(_) if wait_was_interrupted() => Ok(Some(WaitOutcome::Interrupted)),
+        Err(_) if the_limit_passed() => Ok(Some(WaitOutcome::TimedOut)),
+        // A transport failure still falls back to the durable record.
         Err(_) => Ok(None),
     }
 }
@@ -5925,6 +6417,12 @@ fn catch_run_signals() {
 /// stop the job. It continues, and `qex list` finds it. Use `qex submit` for
 /// work that must live longer than the command that starts it.
 pub fn run(args: cli::RunArgs) -> Result<i32> {
+    if args.submit.result.agent
+        || !args.submit.result.fields.is_empty()
+        || args.submit.result.max_bytes.is_some()
+    {
+        bail!("qex run streams job output; use qex submit --agent -- COMMAND for a bounded record");
+    }
     // Name the command that the READER typed. `qex submit --follow` is this
     // same command in a longer form, and a message about `qex run` names a
     // command that such a reader never used.

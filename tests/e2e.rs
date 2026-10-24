@@ -10213,8 +10213,20 @@ fn the_completions_hold_the_commands_of_qex() {
     // never ran and zsh offered no job at all. It is not enough that the file
     // holds the words; the job argument must name the function.
     let zsh = h.ok(&["completions", "zsh"]);
+    let status_part = zsh
+        .split("\n(status)\n")
+        .nth(1)
+        .expect("zsh needs the status command block")
+        .split("\n;;")
+        .next()
+        .unwrap();
+    assert!(
+        status_part.lines().any(|line| {
+            line.starts_with("'*::ids -- ") && line.ends_with(": _qex_jobs ids' \\")
+        }),
+        "the zsh status job argument must offer the jobs: {status_part}"
+    );
     for (line, what) in [
-        ("':id -- The job id, or the start of the id", "ids"),
         ("'*::ids -- The job ids to wait for", "ids"),
         ("'*::ids -- The job ids to stop", "active"),
         ("'*::ids -- The job ids to remove from the queue", "queued"),
@@ -20311,4 +20323,722 @@ fn a_cancel_of_many_ids_gives_a_line_for_each() {
         String::from_utf8_lossy(&kill.stderr).contains("Use `qex cancel"),
         "a kill of one job that waits names the command that fits"
     );
+}
+
+// Each B scenario shares one deadline across setup, observation and reattachment.
+fn b_ok(qex: &dyn Fn(&[&str]) -> Output, args: &[&str]) -> String {
+    let out = qex(args);
+    assert!(
+        out.status.success(),
+        "{args:?}: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    String::from_utf8(out.stdout).unwrap().trim().to_string()
+}
+
+fn b_submit(qex: &dyn Fn(&[&str]) -> Output, args: &[&str]) -> String {
+    let id = b_ok(qex, args);
+    assert!(id.parse::<uuid::Uuid>().is_ok(), "{id}");
+    id
+}
+
+#[test]
+fn qex_b_agent_success_failure_and_legacy_shapes() {
+    let h = Harness::with_default_config("bresult");
+    let deadline = Instant::now() + Duration::from_secs(45);
+    let qex = |args: &[&str]| h.command_until(h.command(args), &args.join(" "), deadline);
+    let ok = qex(&["submit", "--agent", "--", "sh", "-c", "printf 'hello\\n'"]);
+    assert!(
+        ok.status.success(),
+        "{}",
+        String::from_utf8_lossy(&ok.stderr)
+    );
+    let result: serde_json::Value = serde_json::from_slice(&ok.stdout).unwrap();
+    assert_eq!(result["version"], 1);
+    assert_eq!(result["observation"], "complete");
+    let row = &result["results"][0];
+    let id = row["id"].as_str().unwrap();
+    assert_eq!(row["state"], "completed");
+    assert_eq!(row["exit_code"], 0);
+    assert_eq!(row["deduplicated"], false);
+    assert_eq!(row["logs"]["stdout"]["text"], "hello\n");
+    assert_eq!(row["continuation"], serde_json::json!([]));
+    assert!(row.get("command").is_none());
+    assert!(row.get("env").is_none());
+    assert!(row.get("submitter").is_none());
+
+    let status = qex(&["status", id, "--agent"]);
+    let status: serde_json::Value = serde_json::from_slice(&status.stdout).unwrap();
+    let waited = qex(&["wait", id, "--agent"]);
+    let waited: serde_json::Value = serde_json::from_slice(&waited.stdout).unwrap();
+    assert_eq!(status, waited);
+    assert_eq!(
+        status["results"][0]["deduplicated"],
+        serde_json::Value::Null
+    );
+    let legacy =
+        serde_json::from_slice::<serde_json::Value>(&qex(&["status", id, "--json"]).stdout)
+            .unwrap();
+    assert_eq!(legacy["id"], id);
+    assert!(legacy.get("results").is_none());
+    let legacy_wait = qex(&["wait", id, "--json"]);
+    assert!(
+        serde_json::from_slice::<serde_json::Value>(&legacy_wait.stdout)
+            .unwrap()
+            .is_array()
+    );
+
+    let failed = qex(&[
+        "submit",
+        "--agent",
+        "--",
+        "sh",
+        "-c",
+        "printf 'bad\\n' >&2; exit 143",
+    ]);
+    assert_eq!(failed.status.code(), Some(97));
+    let failed: serde_json::Value = serde_json::from_slice(&failed.stdout).unwrap();
+    assert_eq!(failed["observation"], "complete");
+    assert_eq!(failed["results"][0]["exit_code"], 143);
+    assert_eq!(failed["results"][0]["state"], "failed");
+    assert_eq!(failed["results"][0]["logs"]["stderr"]["text"], "bad\n");
+    let signalled = qex(&["submit", "--agent", "--", "sh", "-c", "kill -USR1 $$"]);
+    assert_eq!(signalled.status.code(), Some(98));
+    let signalled: serde_json::Value = serde_json::from_slice(&signalled.stdout).unwrap();
+    assert_eq!(signalled["results"][0]["signal"], libc::SIGUSR1);
+}
+
+#[test]
+fn qex_b_agent_timeout_dedupe_and_executable_continuation() {
+    let h = Harness::with_default_config("btimeout");
+    let deadline = Instant::now() + Duration::from_secs(45);
+    let qex = |args: &[&str]| h.command_until(h.command(args), &args.join(" "), deadline);
+    let paused: serde_json::Value =
+        serde_json::from_slice(&qex(&["pause", "queue", "--json"]).stdout).unwrap();
+    let first = qex(&[
+        "submit",
+        "--agent",
+        "--wait-timeout",
+        "0.2s",
+        "--dedupe-key",
+        "owned-b",
+        "--",
+        "true",
+    ]);
+    assert_eq!(
+        first.status.code(),
+        Some(124),
+        "{}",
+        String::from_utf8_lossy(&first.stderr)
+    );
+    let first: serde_json::Value = serde_json::from_slice(&first.stdout).unwrap();
+    assert_eq!(first["observation"], "timeout");
+    let row = &first["results"][0];
+    let id = row["id"].as_str().unwrap();
+    assert_eq!(row["state"], "queued");
+    assert_eq!(row["exit_code"], serde_json::Value::Null);
+    assert!(!row["blocked_reason"].as_str().unwrap().is_empty());
+    let again = qex(&[
+        "submit",
+        "--agent",
+        "--wait-timeout",
+        "0.1s",
+        "--dedupe-key",
+        "owned-b",
+        "--",
+        "false",
+    ]);
+    assert_eq!(again.status.code(), Some(124));
+    let again: serde_json::Value = serde_json::from_slice(&again.stdout).unwrap();
+    assert_eq!(again["results"][0]["id"], id);
+    assert_eq!(again["results"][0]["deduplicated"], true);
+    b_ok(
+        &qex,
+        &[
+            "resume",
+            "queue",
+            "--pause",
+            paused["pause_id"].as_str().unwrap(),
+        ],
+    );
+    let argv: Vec<&str> = row["continuation"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .skip(1)
+        .map(|v| v.as_str().unwrap())
+        .collect();
+    let reattached = qex(&argv);
+    // A slow host can use the small inherited limit; the job must still survive.
+    assert!(matches!(reattached.status.code(), Some(0 | 124)));
+    let done = qex(&["wait", id, "--agent", "--wait-timeout", "10s"]);
+    assert!(done.status.success());
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&qex(&["status", id, "--json"]).stdout)
+            .unwrap()["state"],
+        "completed"
+    );
+}
+
+#[test]
+fn qex_b_batch_retains_missing_and_live_targets_with_one_deadline() {
+    let h = Harness::with_default_config("bbatch");
+    let deadline = Instant::now() + Duration::from_secs(45);
+    let qex = |args: &[&str]| h.command_until(h.command(args), &args.join(" "), deadline);
+    let done = b_submit(&qex, &["submit", "--", "true"]);
+    b_ok(&qex, &["wait", &done]);
+    b_ok(&qex, &["pause", "queue"]);
+    let a = b_submit(&qex, &["submit", "--", "true"]);
+    let b = b_submit(&qex, &["submit", "--", "true"]);
+    let missing = "00000000-0000-4000-8000-000000000000";
+    let out = qex(&["status", &done, missing, &a, "--json"]);
+    assert_eq!(out.status.code(), Some(127));
+    let batch: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(batch.as_array().unwrap().len(), 3);
+    assert_eq!(batch[0]["id"], done);
+    assert_eq!(batch[1]["id"], missing);
+    assert_eq!(batch[1]["observation"], "missing");
+    assert_eq!(batch[2]["state"], "queued");
+
+    let start = Instant::now();
+    let out = qex(&[
+        "status",
+        &done,
+        &a,
+        &b,
+        "--agent",
+        "--wait",
+        "--wait-timeout",
+        "0.7s",
+    ]);
+    assert_eq!(
+        out.status.code(),
+        Some(124),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        start.elapsed() < Duration::from_millis(1300),
+        "batch reset the observation deadline"
+    );
+    let batch: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(batch["results"].as_array().unwrap().len(), 3);
+    assert_eq!(batch["results"][0]["observation"], "complete");
+    for index in [1, 2] {
+        assert_eq!(batch["results"][index]["observation"], "timeout");
+        assert_eq!(batch["results"][index]["state"], "queued");
+    }
+    let mixed = qex(&["wait", missing, &done, "--agent", "--wait-timeout", "1s"]);
+    assert_eq!(mixed.status.code(), Some(127));
+    let mixed: serde_json::Value = serde_json::from_slice(&mixed.stdout).unwrap();
+    assert_eq!(mixed["observation"], "partial");
+    assert_eq!(mixed["results"][1]["observation"], "complete");
+}
+
+#[test]
+fn qex_b_agent_fields_budget_and_pre_admission_validation() {
+    let h = Harness::with_default_config("bfields");
+    let deadline = Instant::now() + Duration::from_secs(45);
+    let qex = |args: &[&str]| h.command_until(h.command(args), &args.join(" "), deadline);
+    for args in [
+        vec!["submit", "--agent", "--fields", "staet", "--", "true"],
+        vec!["submit", "--agent", "--wait-timeout", "0", "--", "true"],
+        vec!["submit", "--agent", "--wait-timeout", "wrong", "--", "true"],
+        vec!["submit", "--agent", "--follow", "--", "true"],
+        vec!["run", "--agent", "--", "true"],
+        vec!["submit", "--agent", "--each-line", "missing", "--", "true"],
+        vec!["submit", "--agent", "--max-bytes", "12", "--", "true"],
+    ] {
+        let out = qex(&args);
+        assert!(!out.status.success(), "accepted {args:?}");
+        assert!(
+            !h.root.join("state/qex/jobs").exists(),
+            "admitted work for {args:?}"
+        );
+    }
+    let out = qex(&[
+        "submit",
+        "--agent",
+        "--max-bytes",
+        "1024",
+        "--",
+        "sh",
+        "-c",
+        "printf '%5000s' ''; printf '\\\"\\t\\001%.0s' $(seq 1 2000)",
+    ]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        out.stdout.len() <= 1024,
+        "encoded bytes: {}",
+        out.stdout.len()
+    );
+    let result: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(result["results"][0]["logs_truncated"], true);
+    let id = result["results"][0]["id"].as_str().unwrap();
+    let out = qex(&["status", id, "--agent", "--fields", "state,exit_code"]);
+    let selected: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(selected["results"][0]["id"], id);
+    assert_eq!(selected["results"][0]["state"], "completed");
+    assert!(selected["results"][0].get("logs").is_none());
+    let legacy = qex(&["status", id, "--json", "--fields", "id,state"]);
+    let legacy: serde_json::Value = serde_json::from_slice(&legacy.stdout).unwrap();
+    assert_eq!(legacy.as_object().unwrap().len(), 2);
+    let bad_field = qex(&["status", "unread-target", "--agent", "--fields", "staet"]);
+    assert!(String::from_utf8_lossy(&bad_field.stderr).contains("unknown result field"));
+}
+
+#[test]
+fn qex_b_agent_minimal_environment_and_explicit_overrides() {
+    let mut h = Harness::with_default_config("benv");
+    let deadline = Instant::now() + Duration::from_secs(45);
+    h.extra_env
+        .push(("QEX_B_PRIVATE_TEST".into(), "sentinel".into()));
+    let qex = |args: &[&str]| h.command_until(h.command(args), &args.join(" "), deadline);
+    let file = h.root.join("capture.json");
+    std::fs::write(&file, r#"{"command":["true"],"env_capture":"all"}"#).unwrap();
+    for (extra, expected) in [
+        (vec![], false),
+        (vec!["--env-capture", "all"], true),
+        (vec!["--no-env-capture"], false),
+        (vec!["--env", "QEX_B_PRIVATE_TEST=explicit"], true),
+    ] {
+        let mut args = vec!["submit", "--agent", "--fields", "state,env,resources"];
+        args.extend(extra);
+        args.extend(["--", "/bin/true"]);
+        let out = qex(&args);
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let value: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+        assert_eq!(
+            value["results"][0]["env"]
+                .get("QEX_B_PRIVATE_TEST")
+                .is_some(),
+            expected
+        );
+        assert!(value["results"][0]["resources"]["cpu"].is_number());
+    }
+    let out = qex(&[
+        "submit",
+        "--agent",
+        "--job",
+        file.to_str().unwrap(),
+        "--fields",
+        "env",
+    ]);
+    let value: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(value["results"][0]["env"]["QEX_B_PRIVATE_TEST"], "sentinel");
+}
+
+// These fixtures own no worker threads. The child guard joins on every path,
+// including a failed request acknowledgement or assertion.
+struct BObservationChild(Option<std::process::Child>);
+
+impl BObservationChild {
+    fn finish(&mut self, deadline: Instant) -> Output {
+        while self.0.as_mut().unwrap().try_wait().unwrap().is_none() {
+            assert!(Instant::now() < deadline, "observation child did not stop");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        self.0.take().unwrap().wait_with_output().unwrap()
+    }
+}
+
+impl Drop for BObservationChild {
+    fn drop(&mut self) {
+        if let Some(child) = &mut self.0 {
+            if child.try_wait().ok().flatten().is_none() {
+                let _ = child.kill();
+            }
+            let _ = child.wait();
+        }
+    }
+}
+
+fn b_durable_record(h: &Harness, state: &str) -> String {
+    let id = "01900000-0000-7000-8000-000000000001";
+    std::fs::create_dir_all(h.job_dir(id)).unwrap();
+    std::fs::write(
+        h.job_dir(id).join("status.json"),
+        serde_json::to_vec(&serde_json::json!({
+            "id":id, "name":"fixture", "state":state, "submitted_at":1,
+            "cpu":1, "mem":1024, "exit_code":if state == "completed" {Some(0)} else {None},
+            "usage":{"max_rss":0, "cpu_secs":0}, "tags":[]
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    id.into()
+}
+
+fn b_listener(h: &Harness) -> std::os::unix::net::UnixListener {
+    let run = h.root.join("state/qex/run");
+    std::fs::create_dir_all(&run).unwrap();
+    std::os::unix::net::UnixListener::bind(run.join("s")).unwrap()
+}
+
+fn b_accept(
+    listener: &std::os::unix::net::UnixListener,
+    deadline: Instant,
+) -> std::io::BufReader<std::os::unix::net::UnixStream> {
+    use std::os::fd::AsRawFd;
+    let mut fd = libc::pollfd {
+        fd: listener.as_raw_fd(),
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    let left = deadline.saturating_duration_since(Instant::now());
+    assert!(!left.is_zero(), "scenario deadline passed before accept");
+    assert_eq!(
+        unsafe { libc::poll(&mut fd, 1, left.as_millis().min(i32::MAX as u128) as i32) },
+        1
+    );
+    std::io::BufReader::new(listener.accept().unwrap().0)
+}
+
+fn b_request(
+    stream: &mut std::io::BufReader<std::os::unix::net::UnixStream>,
+    deadline: Instant,
+) -> serde_json::Value {
+    use std::io::BufRead;
+    let left = deadline.saturating_duration_since(Instant::now());
+    assert!(!left.is_zero(), "scenario deadline passed before request");
+    stream.get_ref().set_read_timeout(Some(left)).unwrap();
+    let mut line = String::new();
+    stream.read_line(&mut line).unwrap();
+    serde_json::from_str(&line).unwrap()
+}
+
+fn b_answer(
+    stream: &mut std::io::BufReader<std::os::unix::net::UnixStream>,
+    answer: serde_json::Value,
+) {
+    use std::io::Write;
+    writeln!(stream.get_mut(), "{answer}").unwrap();
+}
+
+#[test]
+fn qex_b_agent_interruption_leaves_job_queued() {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    // Each phase acknowledges a request after signal-handler registration.
+    // The default RPC budget is deliberately much longer than this test.
+    for phase in ["capabilities", "resolve", "fragment", "wait"] {
+        let h = Harness::with_default_config(&format!("bint{phase}"));
+        let id = b_durable_record(&h, "queued");
+        let listener = b_listener(&h);
+        let mut child = BObservationChild(Some(h.spawn(&[
+            "wait",
+            &id,
+            "--agent",
+            "--wait-timeout",
+            "10m",
+        ])));
+        let mut stream = b_accept(&listener, deadline);
+        assert_eq!(b_request(&mut stream, deadline)["op"], "capabilities");
+        if phase != "capabilities" {
+            b_answer(
+                &mut stream,
+                serde_json::json!({"result":"capabilities", "names":["resolve"]}),
+            );
+            assert_eq!(b_request(&mut stream, deadline)["op"], "resolve");
+        }
+        if phase == "fragment" {
+            use std::io::Write;
+            stream.get_mut().write_all(b"{\"result\":").unwrap();
+        }
+        if phase == "wait" {
+            let resolved = serde_json::json!({"result":"resolved", "found":[{
+                "handle":id, "group":null, "error":null,
+                "jobs":[{"id":id, "name":"fixture", "state":"queued"}]
+            }]});
+            b_answer(&mut stream, resolved.clone());
+            stream = b_accept(&listener, deadline);
+            assert_eq!(b_request(&mut stream, deadline)["op"], "capabilities");
+            b_answer(
+                &mut stream,
+                serde_json::json!({"result":"capabilities", "names":["resolve"]}),
+            );
+            assert_eq!(b_request(&mut stream, deadline)["op"], "resolve");
+            b_answer(&mut stream, resolved);
+            assert_eq!(b_request(&mut stream, deadline)["op"], "wait");
+        }
+        let interrupted = Instant::now();
+        assert_eq!(
+            unsafe { libc::kill(child.0.as_ref().unwrap().id() as i32, libc::SIGINT) },
+            0
+        );
+        let out = child.finish(deadline.min(interrupted + Duration::from_secs(2)));
+        assert_eq!(
+            out.status.code(),
+            Some(122),
+            "{phase}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let value: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+        assert_eq!(value["observation"], "interrupted", "{phase}");
+        assert_eq!(value["results"][0]["state"], "queued");
+        assert_eq!(value["results"][0]["id"], id);
+        assert!(value["results"][0]["error"].is_null());
+        assert_eq!(value["results"][0]["continuation"][2], id);
+        let record: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(h.job_dir(&id).join("status.json")).unwrap())
+                .unwrap();
+        assert_eq!(record["state"], "queued");
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn qex_b_full_backlog_interrupt_retains_the_record() {
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let h = Harness::with_default_config("bbacklog");
+    let id = b_durable_record(&h, "queued");
+    let run = h.root.join("state/qex/run");
+    std::fs::create_dir_all(&run).unwrap();
+    let _sockets = a_socket_that_never_answers(&run.join("s"))
+        .expect("Linux must expose the full socket backlog");
+    let mut child = BObservationChild(Some(h.spawn(&[
+        "wait",
+        &id,
+        "--agent",
+        "--wait-timeout",
+        "10s",
+    ])));
+    loop {
+        assert!(child.0.as_mut().unwrap().try_wait().unwrap().is_none());
+        let status =
+            std::fs::read_to_string(format!("/proc/{}/status", child.0.as_ref().unwrap().id()))
+                .unwrap();
+        let caught = status
+            .lines()
+            .find_map(|line| line.strip_prefix("SigCgt:"))
+            .map(|mask| u64::from_str_radix(mask.trim(), 16).unwrap())
+            .unwrap();
+        if caught & (1 << (libc::SIGINT - 1)) != 0 {
+            break;
+        }
+        assert!(Instant::now() < deadline, "no observed SIGINT handler");
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    let sent = Instant::now();
+    assert_eq!(
+        unsafe { libc::kill(child.0.as_ref().unwrap().id() as i32, libc::SIGINT) },
+        0
+    );
+    let out = child.finish(deadline.min(sent + Duration::from_secs(1)));
+    assert_eq!(
+        out.status.code(),
+        Some(122),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let value: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(value["observation"], "interrupted");
+    assert_eq!(value["results"][0]["state"], "queued");
+    assert_eq!(value["results"][0]["continuation"][2], id);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn qex_b_partial_native_wait_obeys_signal_and_deadline() {
+    use std::io::Write;
+    use std::os::fd::AsRawFd;
+    struct Feed {
+        stop: std::sync::mpsc::Sender<()>,
+        worker: Option<std::thread::JoinHandle<()>>,
+    }
+    impl Drop for Feed {
+        fn drop(&mut self) {
+            let _ = self.stop.send(());
+            if let Some(worker) = self.worker.take() {
+                worker.join().unwrap();
+            }
+        }
+    }
+    let deadline = Instant::now() + Duration::from_secs(15);
+    for interrupt in [true, false] {
+        let h = Harness::with_default_config(if interrupt {
+            "bnativeint"
+        } else {
+            "bnativelimit"
+        });
+        let id = b_durable_record(&h, "queued");
+        let listener = b_listener(&h);
+        let started = Instant::now();
+        let mut child = BObservationChild(Some(h.spawn(&[
+            "wait",
+            &id,
+            "--agent",
+            "--wait-timeout",
+            "0.5s",
+        ])));
+        let mut stream = b_accept(&listener, deadline);
+        for connection in 0..2 {
+            assert_eq!(b_request(&mut stream, deadline)["op"], "capabilities");
+            b_answer(
+                &mut stream,
+                serde_json::json!({"result":"capabilities", "names":["resolve"]}),
+            );
+            assert_eq!(b_request(&mut stream, deadline)["op"], "resolve");
+            b_answer(
+                &mut stream,
+                serde_json::json!({"result":"resolved", "found":[{
+                    "handle":id, "group":null, "error":null,
+                    "jobs":[{"id":id, "name":"fixture", "state":"queued"}]
+                }]}),
+            );
+            if connection == 0 {
+                stream = b_accept(&listener, deadline);
+            }
+        }
+        assert_eq!(b_request(&mut stream, deadline)["op"], "wait");
+        stream.get_mut().write_all(b"{\"result\":").unwrap();
+        // The queue drains only when this child consumes the incomplete frame.
+        loop {
+            let mut queued: libc::c_int = 0;
+            assert_eq!(
+                unsafe { libc::ioctl(stream.get_ref().as_raw_fd(), libc::TIOCOUTQ, &mut queued) },
+                0
+            );
+            if queued == 0 {
+                break;
+            }
+            assert!(Instant::now() < deadline, "partial reply was not consumed");
+            assert!(child.0.as_mut().unwrap().try_wait().unwrap().is_none());
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        let (stop, stopped) = std::sync::mpsc::channel();
+        let mut writer = stream.get_ref().try_clone().unwrap();
+        writer
+            .set_write_timeout(Some(deadline.saturating_duration_since(Instant::now())))
+            .unwrap();
+        let feed = Feed {
+            stop,
+            worker: Some(std::thread::spawn(move || {
+                while Instant::now() < deadline {
+                    if stopped.recv_timeout(Duration::from_millis(40)).is_ok() {
+                        return;
+                    }
+                    if writer.write_all(b" ").is_err() {
+                        return;
+                    }
+                }
+            })),
+        };
+        if interrupt {
+            assert_eq!(
+                unsafe { libc::kill(child.0.as_ref().unwrap().id() as i32, libc::SIGINT) },
+                0
+            );
+        }
+        let out = child.finish(deadline.min(started + Duration::from_secs(2)));
+        drop(feed);
+        assert_eq!(
+            out.status.code(),
+            Some(if interrupt { 122 } else { 124 }),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let value: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+        assert_eq!(
+            value["observation"],
+            if interrupt { "interrupted" } else { "timeout" }
+        );
+        assert_eq!(value["results"][0]["state"], "queued");
+        assert_eq!(value["results"][0]["continuation"][2], id);
+        if !interrupt {
+            assert!(started.elapsed() >= Duration::from_millis(500));
+        }
+    }
+}
+
+#[test]
+fn qex_b_access_failure_keeps_cause_and_disk_fallback() {
+    use std::os::unix::fs::PermissionsExt;
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let h = Harness::with_default_config("baccess");
+    let id = b_durable_record(&h, "completed");
+    let _listener = b_listener(&h);
+    let path = h.root.join("state/qex/run/s");
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o0)).unwrap();
+    let out = h.command_until(
+        h.command(&["status", "active-name", &id, "--agent", "--no-logs"]),
+        "inaccessible resolver",
+        deadline,
+    );
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).unwrap();
+    assert_eq!(out.status.code(), Some(1));
+    let value: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(value["observation"], "partial");
+    assert_eq!(value["results"][0]["observation"], "error");
+    let error = value["results"][0]["error"].as_str().unwrap();
+    assert!(error.contains("Permission denied"), "{error}");
+    assert_eq!(value["results"][1]["observation"], "complete");
+    assert!(value["results"][1]["error"].is_null());
+}
+
+#[test]
+fn qex_b_failed_resolver_keeps_successful_disk_snapshot() {
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let h = Harness::with_default_config("bdisconnect");
+    let id = b_durable_record(&h, "completed");
+    let args = ["status", &id, "--agent", "--no-logs"];
+    let offline = h.command_until(h.command(&args), "offline control", deadline);
+    assert!(offline.status.success());
+    let listener = b_listener(&h);
+    let mut child = BObservationChild(Some(h.spawn(&args)));
+    let mut stream = b_accept(&listener, deadline);
+    assert_eq!(b_request(&mut stream, deadline)["op"], "capabilities");
+    drop(stream);
+    let out = child.finish(deadline);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(out.stdout, offline.stdout);
+}
+
+#[test]
+fn qex_b_offline_batch_reports_corrupt_records_and_budget_errors() {
+    let h = Harness::with_default_config("boffline");
+    let deadline = Instant::now() + Duration::from_secs(45);
+    let qex = |args: &[&str]| h.command_until(h.command(args), &args.join(" "), deadline);
+    let good = b_submit(&qex, &["submit", "--", "true"]);
+    let bad = b_submit(&qex, &["submit", "--", "true"]);
+    b_ok(&qex, &["wait", &good, &bad]);
+    h.stop_coordinator();
+    std::fs::write(h.job_dir(&bad).join("status.json"), "{broken").unwrap();
+    let out = qex(&["status", &good, &bad, "--agent", "--fields", "state"]);
+    assert_eq!(out.status.code(), Some(1));
+    let value: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(value["results"].as_array().unwrap().len(), 2);
+    assert_eq!(value["results"][0]["state"], "completed");
+    assert_eq!(value["results"][1]["id"], bad);
+    assert_eq!(value["results"][1]["observation"], "error");
+    assert!(value["results"][1]["error"].is_string());
+
+    let path = h.job_dir(&good).join("status.json");
+    let mut record: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    record["command"] = serde_json::json!(["x".repeat(2048)]);
+    std::fs::write(&path, serde_json::to_vec(&record).unwrap()).unwrap();
+    let out = qex(&[
+        "status",
+        &good,
+        "--agent",
+        "--fields",
+        "command",
+        "--max-bytes",
+        "1024",
+    ]);
+    assert!(!out.status.success());
+    assert!(out.stdout.is_empty(), "budget failure emitted partial JSON");
+    assert!(String::from_utf8_lossy(&out.stderr).contains("too small for the selected metadata"));
 }

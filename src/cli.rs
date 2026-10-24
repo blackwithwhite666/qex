@@ -126,7 +126,7 @@ pub enum Command {
     /// Show the configuration or its location.
     Config(ConfigArgs),
 
-    /// Write the JSON Schema of a qex format: job, status, pipeline or event.
+    /// Write a JSON Schema: job, status, pipeline, event or agent-result.
     Schema(SchemaArgs),
 
     /// Show the real commands, arguments and published output schemas. Works offline.
@@ -371,7 +371,7 @@ pub struct SubmitArgs {
     /// Stop the wait of --wait after this time. The job continues. Example: 30m.
     ///
     /// This option limits YOUR WAIT. `--timeout` limits the JOB.
-    #[arg(long, value_name = "TIME", requires = "wait")]
+    #[arg(long, value_name = "TIME")]
     pub wait_timeout: Option<String>,
 
     /// Write the id and the result of the dedupe test as JSON.
@@ -381,6 +381,9 @@ pub struct SubmitArgs {
     /// `ID=$(qex submit ...)` stays correct.
     #[arg(long)]
     pub json: bool,
+
+    #[command(flatten)]
+    pub result: ResultArgs,
 
     /// Submit one job for each line of this file. Use `-` for standard input.
     ///
@@ -477,10 +480,14 @@ pub struct ListArgs {
     pub json: bool,
 }
 
-#[derive(Debug, Args)]
+#[derive(Debug, Args, Clone)]
 pub struct StatusArgs {
-    /// The job id, or the start of the id.
-    pub id: String,
+    /// Job ids, prefixes, names or groups. A single job keeps its JSON shape.
+    #[arg(required = true, value_name = "ID")]
+    pub ids: Vec<String>,
+
+    #[command(flatten)]
+    pub result: ResultArgs,
 
     /// Write the output as JSON.
     #[arg(long)]
@@ -563,6 +570,48 @@ pub struct WaitArgs {
     /// Write the output as JSON.
     #[arg(long)]
     pub json: bool,
+
+    #[command(flatten)]
+    pub result: ResultArgs,
+}
+
+/// Output controls shared by the existing job readers.
+#[derive(Debug, Args, Clone, Default)]
+pub struct ResultArgs {
+    /// Return a compact versioned result. Submit also waits (default: 10m)
+    /// and defaults to minimal environment capture. Explicit capture wins.
+    #[arg(long, conflicts_with_all = ["quiet"])]
+    pub agent: bool,
+
+    /// Select comma-separated top-level JSON fields. id and observation stay
+    /// in agent records. Use --agent or --json. Unknown fields fail before reads.
+    #[arg(long, value_delimiter = ',', value_parser = parse_result_field)]
+    pub fields: Vec<String>,
+
+    /// Maximum encoded JSON bytes, including the newline. Agent default: 16384.
+    /// Logs are shortened first; metadata that cannot fit gives an error.
+    #[arg(long, value_name = "N", value_parser = clap::value_parser!(u64).range(1024..=1048576))]
+    pub max_bytes: Option<u64>,
+}
+
+fn parse_result_field(raw: &str) -> Result<String, String> {
+    let status: serde_json::Value = serde_json::from_str(crate::schema::STATUS).unwrap();
+    if status["properties"].get(raw).is_some()
+        || matches!(
+            raw,
+            "observation"
+                | "continuation"
+                | "deduplicated"
+                | "resources"
+                | "env"
+                | "logs"
+                | "logs_truncated"
+        )
+    {
+        Ok(raw.to_string())
+    } else {
+        Err(format!("unknown result field `{raw}`; use a top-level field from `qex schema status` or observation, continuation, deduplicated, resources, env"))
+    }
 }
 
 #[derive(Debug, Args)]
@@ -926,7 +975,7 @@ pub enum ConfigAction {
 
 #[derive(Debug, Args)]
 pub struct SchemaArgs {
-    /// The schema to write: job, status, pipeline or event.
+    /// The schema: job, status, pipeline, event or agent-result.
     #[arg(value_name = "WHICH")]
     pub which: Option<String>,
 }
