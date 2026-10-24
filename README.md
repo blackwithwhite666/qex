@@ -71,6 +71,51 @@ the moment somebody kills the job, where a log-watcher would still be sleeping.
 id to read the state of the job, read its output, stop it, or remove it from the
 queue.
 
+## Agent results
+
+`qex submit --agent --cpu 2 --mem 3GB -- make test` captures the minimal
+environment by default and observes the job for up to ten minutes. Override
+the observation with `--wait-timeout 30m`. Explicit `--env-capture`,
+`--no-env-capture`, job-file capture and `--env KEY=VALUE` choices still apply.
+Resource claims and runtime worker settings remain explicit choices.
+
+Submit, `qex status ID --agent` and `qex wait ID --agent` return the same
+versioned JSON shape: `version`, `observation` and a `results` array. Each
+default record includes the full job ID, state, original exit code and signal,
+observation outcome, queue reason, claim and its sources, bounded log excerpts,
+dedupe outcome and continuation argv. `complete` means the job stopped; the
+state and exit code tell whether it succeeded. `timeout` or `interrupted`
+describes the observation and leaves the job active. Submit reports whether
+admission was deduplicated; subsequent reads use null for that field.
+
+Use `qex status A B --json` for a batch, or add `--agent` for the envelope.
+Missing and unreadable targets keep explicit entries. Waiting for several
+jobs uses one shared deadline. A single legacy status JSON stays an object;
+batch status is an array. Nonwaiting status returns zero for readable records;
+waits return the existing job or observation exit code. A partial batch returns
+127 for missing targets or 1 for other read errors; timeout/interruption takes
+priority when the wait ends early.
+
+`--fields id,state,exit_code` selects known top-level JSON fields. Status and
+wait accept it with `--json` or `--agent`; submit requires `--agent`. Agent
+records always retain `id`, `observation` and `logs_truncated`; read failures
+also retain `error`. Full command, environment and submitter details require
+explicit fields. Unknown selectors fail before any job read or admission.
+`qex schema status` lists job fields; `qex schema agent-result` describes the
+envelope and extra fields. `resources` summarizes the CPU/memory claim sources.
+
+Agent output defaults to 16384 encoded JSON bytes including the final newline.
+`--max-bytes N` accepts 1024 to 1048576 bytes. The budget applies to the whole
+batch, including escaping. Log text is shortened first and `logs_truncated`
+reports that loss. Selected metadata that cannot fit gives a clear error;
+qex never removes a job to fit the budget. Agent log selection defaults to the
+last 20 lines of each available stream; status accepts its existing stream,
+line and search options. `hidden_lines` describes selection loss. Use the
+explicit `logs_dropped` field for any retention loss. `--no-logs` suppresses
+excerpts. Streaming/fan-out modes and `wait --next` do not accept the agent
+profile. A continuation is an argv array for a bounded observation of the
+same exact active job; terminal or unresolved jobs have an empty array.
+
 ## Install
 
 With [mise](https://mise.jdx.dev/), which needs no build:

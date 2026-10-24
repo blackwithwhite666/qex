@@ -485,6 +485,7 @@ pub struct Client {
     lost_its_place: bool,
     /// What this coordinator can do, after the first question about it.
     capabilities: Option<Vec<String>>,
+    interrupted: Option<fn() -> bool>,
 }
 
 impl Client {
@@ -581,6 +582,18 @@ impl Client {
         }
     }
 
+    /// Check the observation signal while the socket backlog is full too.
+    pub fn connect_existing_interruptible(check: fn() -> bool) -> Result<Option<Self>> {
+        let socket = paths::socket_path().map_err(name_the_sandbox)?;
+        let mut client = try_connect_interruptible(&socket, Some(check))?
+            .map(Client::with_stream)
+            .transpose()?;
+        if let Some(client) = &mut client {
+            client.interrupt_when(check);
+        }
+        Ok(client)
+    }
+
     /// Stops a write to THIS socket from killing the process.
     ///
     /// `main` restores the default action of SIGPIPE, so that `qex list | head`
@@ -624,7 +637,20 @@ impl Client {
             reader,
             lost_its_place: false,
             capabilities: None,
+            interrupted: None,
         })
+    }
+
+    /// Observation readers can stop an in-flight RPC without reusing its reply.
+    pub fn interrupt_when(&mut self, check: fn() -> bool) {
+        self.interrupted = Some(check);
+    }
+
+    fn check_interruption(&self) -> std::io::Result<()> {
+        if self.interrupted.is_some_and(|check| check()) {
+            return Err(std::io::ErrorKind::Interrupted.into());
+        }
+        Ok(())
     }
 
     /// Sends one request and reads one answer, inside the limit for a
@@ -645,6 +671,7 @@ impl Client {
     /// can drive the limit without writing a value that every other test in the
     /// same program would then read.
     fn call_within(&mut self, request: &Request, deadline: Instant) -> Result<Response> {
+        self.check_interruption()?;
         // THE LIMIT OF THE READER PASSED BEFORE THIS QUESTION. Ask nothing, and
         // say which limit ended the command. See `spent_limit_of_the_reader`.
         // This test comes first: the state of the connection is a detail of
@@ -674,9 +701,15 @@ impl Client {
         // waited too long for THIS answer — so nothing that the command did
         // earlier shortens it.
         let started = Instant::now();
+        let answer_deadline = previous_timeout
+            .map(|time| (started + time).min(deadline))
+            .unwrap_or(deadline);
 
         let answer = loop {
-            let left = deadline.saturating_duration_since(Instant::now());
+            if let Err(error) = self.check_interruption() {
+                break Err(error.into());
+            }
+            let left = answer_deadline.saturating_duration_since(Instant::now());
             if left.is_zero() {
                 break Err(timed_out(a_silent_coordinator(started.elapsed())));
             }
@@ -684,13 +717,20 @@ impl Client {
             // takes the first part of a line and loses that part, so a large
             // answer that crosses a step would misparse. This call reads
             // nothing, so a step can never divide an answer.
-            let step = left.min(step_of_a_wait());
+            let step = left.min(if self.interrupted.is_some() {
+                Duration::from_millis(250)
+            } else {
+                step_of_a_wait()
+            });
             let poll_for = previous_timeout.map_or(step, |time| time.min(step));
             let readable = if self.reader.buffer().is_empty() {
                 self.wait_readable(poll_for)
             } else {
                 Ok(true)
             };
+            if let Err(error) = self.check_interruption() {
+                break Err(error.into());
+            }
             match readable {
                 // READABLE IS NOT ANSWERED.
                 //
@@ -704,7 +744,7 @@ impl Client {
                 // ends thus reaches the same limit as an answer that never
                 // starts.
                 Ok(true) => {
-                    let got = self.recv_within(deadline, previous_timeout);
+                    let got = self.recv_within(Some(deadline), previous_timeout);
                     self.set_read_timeout(previous_timeout).ok();
                     // A read that reached the limit took the first part of a
                     // line and lost it, so this connection can no longer say
@@ -744,18 +784,42 @@ impl Client {
     /// Keep one deadline while a reply arrives in several fragments.
     fn recv_within(
         &mut self,
-        deadline: Instant,
+        deadline: Option<Instant>,
         socket_timeout: Option<Duration>,
     ) -> Result<Response> {
         let mut line = Vec::new();
         loop {
-            let left = deadline.saturating_duration_since(Instant::now());
-            if left.is_zero() {
+            self.check_interruption()?;
+            let now = Instant::now();
+            let read_deadline = match (deadline, socket_timeout) {
+                (Some(end), Some(time)) => Some(end.min(now + time)),
+                (None, Some(time)) => Some(now + time),
+                (end, None) => end,
+            };
+            let left = read_deadline.map(|end| end.saturating_duration_since(now));
+            if left.is_some_and(|time| time.is_zero()) {
                 return Err(std::io::Error::from(std::io::ErrorKind::TimedOut).into());
             }
             // A socket timeout limits each read. Recompute it before each fill,
             // or a peer that keeps sending bytes can hold this call forever.
-            self.set_read_timeout(Some(socket_timeout.map_or(left, |time| time.min(left))))?;
+            self.set_read_timeout(left)?;
+            if self.interrupted.is_some() && self.reader.buffer().is_empty() {
+                loop {
+                    self.check_interruption()?;
+                    let left =
+                        read_deadline.map(|end| end.saturating_duration_since(Instant::now()));
+                    if left.is_some_and(|time| time.is_zero()) {
+                        return Err(std::io::Error::from(std::io::ErrorKind::TimedOut).into());
+                    }
+                    if self.wait_readable(
+                        left.unwrap_or(Duration::from_millis(250))
+                            .min(Duration::from_millis(250)),
+                    )? {
+                        break;
+                    }
+                }
+                self.check_interruption()?;
+            }
             let bytes = self
                 .reader
                 .fill_buf()
@@ -813,11 +877,17 @@ impl Client {
         let fd = self.stream.as_raw_fd();
         let mut sent = 0;
         while sent < bytes.len() {
+            self.check_interruption()?;
             let left = deadline.saturating_duration_since(Instant::now());
             if left.is_zero() {
                 return Err(std::io::ErrorKind::TimedOut.into());
             }
-            self.stream.set_write_timeout(Some(left))?;
+            self.stream
+                .set_write_timeout(Some(if self.interrupted.is_some() {
+                    left.min(Duration::from_millis(250))
+                } else {
+                    left
+                }))?;
             #[cfg(target_vendor = "apple")]
             let flags = 0;
             #[cfg(not(target_vendor = "apple"))]
@@ -838,18 +908,32 @@ impl Client {
             if e.kind() == std::io::ErrorKind::Interrupted {
                 continue;
             }
+            if self.interrupted.is_some()
+                && matches!(
+                    e.kind(),
+                    std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+                )
+            {
+                continue;
+            }
             return Err(e);
         }
         self.stream.set_write_timeout(None)?;
         Ok(())
     }
 
-    /// Reads one response. This function blocks until the coordinator answers.
-    pub fn recv(&mut self) -> Result<Response> {
-        match self.recv_opt()? {
-            Some(response) => Ok(response),
-            None => bail!("the coordinator closed the connection without an answer"),
+    /// Accumulate a native wait reply under its observation limit, not an RPC limit.
+    pub fn recv_until(&mut self, deadline: Option<Instant>) -> Result<Response> {
+        if self.lost_its_place {
+            bail!("this connection has an unfinished answer; run the command again");
         }
+        let previous_timeout = self.stream.read_timeout().ok().flatten();
+        let answer = self.recv_within(deadline, previous_timeout);
+        self.set_read_timeout(previous_timeout).ok();
+        if answer.is_err() {
+            self.lost_its_place = true;
+        }
+        answer
     }
 
     /// Reads one response, and gives `None` at the end of the connection.
@@ -1058,6 +1142,13 @@ fn a_silent_coordinator(waited: Duration) -> String {
 /// each hold the whole budget, and the machine then gets the kill for memory
 /// that qex exists to prevent.
 fn try_connect(socket: &Path) -> Result<Option<UnixStream>> {
+    try_connect_interruptible(socket, None)
+}
+
+fn try_connect_interruptible(
+    socket: &Path,
+    interrupted: Option<fn() -> bool>,
+) -> Result<Option<UnixStream>> {
     // THIS WAIT STARTS NOW, as every wait for an answer does.
     let started = Instant::now();
     // The limit of the reader passed before this connect, so qex probes
@@ -1066,16 +1157,26 @@ fn try_connect(socket: &Path) -> Result<Option<UnixStream>> {
         return Err(the_reader_limit_passed(spent, "connect to the coordinator"));
     }
     let deadline = deadline_for_one_wait();
-    try_connect_with(socket, started, deadline, paths::connect_within)
+    try_connect_with(
+        socket,
+        started,
+        deadline,
+        interrupted,
+        paths::connect_within,
+    )
 }
 
 fn try_connect_with(
     socket: &Path,
     started: Instant,
     deadline: Instant,
+    interrupted: Option<fn() -> bool>,
     mut attempt: impl FnMut(&Path, Duration) -> paths::Connected,
 ) -> Result<Option<UnixStream>> {
     loop {
+        if interrupted.is_some_and(|check| check()) {
+            return Err(std::io::Error::from(std::io::ErrorKind::Interrupted).into());
+        }
         let left = deadline.saturating_duration_since(Instant::now());
         if left.is_zero() {
             // The socket did not answer inside the limit. Say only that, and do
@@ -1092,7 +1193,12 @@ fn try_connect_with(
                     .unwrap_or_else(|_| "the log of the coordinator".to_string())
             )));
         }
-        match attempt(socket, left.min(step_of_a_wait())) {
+        let step = if interrupted.is_some() {
+            Duration::from_millis(250)
+        } else {
+            step_of_a_wait()
+        };
+        match attempt(socket, left.min(step)) {
             paths::Connected::Open(stream) => return Ok(Some(stream)),
             paths::Connected::NobodyListens => return Ok(None),
             paths::Connected::Failed(error) => {
@@ -1525,6 +1631,7 @@ mod tests {
                 Path::new("/test/coordinator"),
                 started,
                 started + Duration::from_secs(1),
+                None,
                 |_, _| {
                     attempts += 1;
                     paths::Connected::Failed(std::io::Error::from_raw_os_error(code))
@@ -1556,6 +1663,7 @@ mod tests {
                 Path::new("/test/coordinator"),
                 started,
                 started + Duration::from_millis(40),
+                None,
                 |_, _| {
                     attempts += 1;
                     if failed {
@@ -1580,6 +1688,7 @@ mod tests {
             Path::new("/test/coordinator"),
             started,
             started + Duration::from_secs(1),
+            None,
             |_, _| {
                 attempts += 1;
                 if attempts < 4 {
@@ -1591,6 +1700,65 @@ mod tests {
         );
         assert!(matches!(answer, Ok(Some(_))));
         assert_eq!(attempts, 4);
+    }
+
+    #[test]
+    fn observation_connect_checks_interruption_between_bounded_attempts() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        static INTERRUPTED: AtomicBool = AtomicBool::new(false);
+        let start = Instant::now();
+        let answer = try_connect_with(
+            Path::new("/test/coordinator"),
+            start,
+            start + Duration::from_secs(2),
+            Some(|| INTERRUPTED.load(Ordering::SeqCst)),
+            |_, limit| {
+                assert!(limit <= Duration::from_millis(250));
+                INTERRUPTED.store(true, Ordering::SeqCst);
+                paths::Connected::NoAnswer
+            },
+        );
+        let error = answer.unwrap_err();
+        assert!(error
+            .downcast_ref::<std::io::Error>()
+            .is_some_and(|e| e.kind() == std::io::ErrorKind::Interrupted));
+        assert!(!is_a_coordinator_timeout(&error));
+        assert!(start.elapsed() < Duration::from_secs(1));
+    }
+
+    #[test]
+    fn native_reply_accumulation_keeps_one_deadline_and_invalidates_the_connection() {
+        for socket_timeout in [None, Some(Duration::from_millis(80))] {
+            let scenario_end = Instant::now() + Duration::from_secs(3);
+            let (ours, mut theirs) = UnixStream::pair().unwrap();
+            theirs
+                .set_write_timeout(Some(Duration::from_millis(100)))
+                .unwrap();
+            let mut client = Client::with_stream(ours).unwrap();
+            client.interrupt_when(|| false);
+            client.set_read_timeout(socket_timeout).unwrap();
+            let (stop, stopped) = std::sync::mpsc::channel();
+            let worker = std::thread::spawn(move || {
+                while Instant::now() < scenario_end {
+                    if theirs.write_all(b" ").is_err() {
+                        return;
+                    }
+                    if stopped.recv_timeout(Duration::from_millis(10)).is_ok() {
+                        return;
+                    }
+                }
+            });
+            let start = Instant::now();
+            let answer = client.recv_until(Some(start + Duration::from_millis(100)));
+            let _ = stop.send(());
+            worker.join().unwrap();
+            assert!(a_read_that_reached_its_limit(&answer.unwrap_err()));
+            assert!(start.elapsed() < Duration::from_millis(500));
+            assert!(client.lost_its_place);
+            assert_eq!(client.stream.read_timeout().unwrap(), socket_timeout);
+            assert!(client.recv_until(Some(scenario_end)).is_err());
+            assert!(client.call_within(&Request::Info, scenario_end).is_err());
+        }
     }
 
     /// A connection that reached a limit must never be read again.
@@ -1646,9 +1814,17 @@ mod tests {
 
     #[test]
     fn an_rpc_deadline_bounds_fragmented_replies_and_keeps_alignment() {
-        for socket_timeout in [None, Some(Duration::from_millis(80))] {
+        for (socket_timeout, interruptible) in [
+            (None, false),
+            (Some(Duration::from_millis(80)), false),
+            (None, true),
+            (Some(Duration::from_millis(80)), true),
+        ] {
             let (ours, mut theirs) = UnixStream::pair().unwrap();
             let mut client = Client::with_stream(ours).unwrap();
+            if interruptible {
+                client.interrupt_when(|| false);
+            }
             client.set_read_timeout(socket_timeout).unwrap();
             let (stop, stopped) = std::sync::mpsc::channel();
             let worker = std::thread::spawn(move || {
@@ -1681,6 +1857,39 @@ mod tests {
                 .to_string()
                 .contains("asked the coordinator nothing more"));
         }
+    }
+
+    #[test]
+    fn an_interrupted_rpc_never_reuses_its_pending_reply() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        static INTERRUPTED: AtomicBool = AtomicBool::new(false);
+        let deadline = Instant::now() + Duration::from_secs(3);
+        let (ours, mut theirs) = UnixStream::pair().unwrap();
+        theirs
+            .set_read_timeout(Some(deadline.saturating_duration_since(Instant::now())))
+            .unwrap();
+        let mut client = Client::with_stream(ours).unwrap();
+        client.interrupt_when(|| INTERRUPTED.load(Ordering::SeqCst));
+        let worker = std::thread::spawn(move || {
+            let mut line = String::new();
+            BufReader::new(&theirs).read_line(&mut line).unwrap();
+            // The request reached the peer before interruption is observable.
+            let _ = theirs.write_all(b"{\"result\":");
+            INTERRUPTED.store(true, Ordering::SeqCst);
+            theirs
+        });
+        let answer = client.call_within(&Request::Info, deadline);
+        let mut peer = worker.join().unwrap();
+        assert!(answer.unwrap_err().chain().any(|e| e
+            .downcast_ref::<std::io::Error>()
+            .is_some_and(|e| e.kind() == std::io::ErrorKind::Interrupted)));
+        assert!(client.lost_its_place);
+        INTERRUPTED.store(false, Ordering::SeqCst);
+        peer.write_all(b"\"capabilities\",\"names\":[]}\n").unwrap();
+        let error = client.call_within(&Request::Info, deadline).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("asked the coordinator nothing more"));
     }
 
     #[test]

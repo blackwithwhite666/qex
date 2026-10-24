@@ -11,11 +11,12 @@ pub fn schema(which: &str) -> Option<&'static str> {
         "status" | "job-status" => Some(STATUS),
         "pipeline" | "pipelines" | "pipeline-file" => Some(PIPELINE),
         "event" | "events" | "stream" => Some(EVENT),
+        "agent-result" => Some(AGENT_RESULT),
         _ => None,
     }
 }
 
-pub const NAMES: &[&str] = &["job", "status", "pipeline", "event"];
+pub const NAMES: &[&str] = &["job", "status", "pipeline", "event", "agent-result"];
 
 /// Describe the built Clap tree, including inherited options and arity.
 /// Only published schemas appear here; an empty list promises no schema.
@@ -46,13 +47,15 @@ pub fn describe() -> serde_json::Value {
         }).collect();
         let outputs = match command.get_name() {
             "status" => {
-                serde_json::json!([{"when": "--json for one job", "schema": "status", "shape": "object"}, {"when": "--json for a group", "schema": "status", "shape": "array"}])
+                serde_json::json!([{"when": "--json for one job", "schema": "status", "shape": "object"}, {"when": "--json for a group or several targets", "schema": "status", "shape": "array (partial reads carry id, observation and error)"}, {"when":"--agent", "schema":"agent-result", "shape":"object"}])
             }
             "submit" => {
-                serde_json::json!([{"when": "--wait --json", "schema": "status", "shape": "object"}])
+                serde_json::json!([{"when": "--wait --json", "schema": "status", "shape": "object"}, {"when":"--agent", "schema":"agent-result", "shape":"object"}])
             }
             "list" => serde_json::json!([{"when": "--json", "schema": "status", "shape": "array"}]),
-            "wait" => serde_json::json!([{"when": "--json", "schema": "status", "shape": "array"}]),
+            "wait" => {
+                serde_json::json!([{"when": "--json", "schema": "status", "shape": "array"}, {"when":"--agent", "schema":"agent-result", "shape":"object"}])
+            }
             "events" => {
                 serde_json::json!([{"when": "--json", "schema": "event", "shape": "json-lines"}])
             }
@@ -78,6 +81,40 @@ pub fn describe() -> serde_json::Value {
         "protocol_help": "Protocol capabilities are coordinator features, not CLI command names.",
     })
 }
+
+pub const AGENT_RESULT: &str = r##"{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "qex agent result v1",
+  "type": "object",
+  "required": ["version", "observation", "results"],
+  "additionalProperties": false,
+  "properties": {
+    "version": {"const": 1},
+    "observation": {"enum": ["snapshot", "complete", "timeout", "interrupted", "partial"]},
+    "results": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["id", "observation"],
+        "description": "Job fields follow schema status. Field selection keeps id, observation, error and logs_truncated. Missing or unreadable targets remain explicit entries. Complete means terminal, including failed jobs.",
+        "properties": {
+          "id": {"type": "string", "description": "Full resolved UUID, or the original unresolved target."},
+          "observation": {"enum": ["snapshot", "complete", "timeout", "interrupted", "missing", "error"]},
+          "state": {"type": ["string", "null"]},
+          "exit_code": {"type": ["integer", "null"]},
+          "signal": {"type": ["integer", "null"]},
+          "blocked_reason": {"type": ["string", "null"]},
+          "error": {"type": ["string", "null"]},
+          "deduplicated": {"type": ["boolean", "null"], "description": "Submit admission outcome; null for a later read."},
+          "continuation": {"type": "array", "items": {"type": "string"}, "description": "Bounded observation argv for an active job; empty for terminal or unresolved jobs."},
+          "resources": {"type": "object", "description": "cpu, mem, cpu_source and mem_source from the job claim."},
+          "logs_truncated": {"type": "boolean", "description": "The response byte budget removed some selected log text. hidden_lines reports line selection; logs_dropped from schema status reports retention loss."},
+          "logs": {"type": "object", "description": "stdout/stderr objects with text and hidden_lines. Default last 20 lines of each available stream. All encoded JSON, including escaping and the final newline, fits max-bytes (default 16384)."}
+        }
+      }
+    }
+  }
+}"##;
 
 pub const JOB: &str = r##"{
   "$schema": "https://json-schema.org/draft/2020-12/schema",
