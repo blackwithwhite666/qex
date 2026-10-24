@@ -20611,11 +20611,13 @@ fn qex_b_agent_minimal_environment_and_explicit_overrides() {
     ] {
         let mut args = vec!["submit", "--agent", "--fields", "state,env,resources"];
         args.extend(extra);
-        args.extend(["--", "/bin/true"]);
+        args.extend(["--", "/bin/sh", "-c", ":"]);
         let out = qex(&args);
         assert!(
             out.status.success(),
-            "{}",
+            "status: {}\nstdout: {}\nstderr: {}",
+            out.status,
+            String::from_utf8_lossy(&out.stdout),
             String::from_utf8_lossy(&out.stderr)
         );
         let value: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
@@ -21649,7 +21651,9 @@ fn qex_d_invalid_inputs_fail_before_admission_and_path_resolves_once() {
         "--notify-codex",
         socket.to_str().unwrap(),
         "--",
-        "/bin/true",
+        "/bin/sh",
+        "-c",
+        ":",
     ]);
     cmd.env("PATH", &h.root);
     let out = h.command_until(cmd, "public client PATH resolution", deadline);
