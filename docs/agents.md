@@ -273,8 +273,11 @@ Every command that reads data accepts `--json`.
 
 ## Things that will catch you
 
-- **`--timeout` limits the job; `--wait-timeout` limits your wait.** Code 124
-  means the job continues.
+- **Use explicit timeout names.** On submit and run, `--job-timeout` aliases
+  `--timeout`, and `--queue-timeout` aliases `--max-queue-time`. On status,
+  wait and events, `--wait-timeout` aliases `--timeout`. A wait that ends with
+  code 124 leaves the job active. `--rpc-timeout` limits each coordinator
+  operation and does not shorten a normal job wait.
 - **A job waits until the machine has capacity.** Add `--max-queue-time 30m`
   when you must have an answer inside a time. The state becomes `expired` and
   the code is 123; nothing ran, so there is no output.
@@ -351,6 +354,13 @@ The page is ordinary Markdown, so it goes into `AGENTS.md`, a rule file or a
 prompt with no change.
 
 ## Everything else
+
+`qex describe --json` lists actual commands, arguments and published output
+schemas without a coordinator. The separate protocol capability list names
+coordinator features, not CLI commands. `qex --version` and
+`qex version --client --json` report the client identity offline. Plain
+`qex version` also checks the coordinator and keeps the client identity in
+its output if that check fails.
 
 `qex help <topic>` covers `job-file`, `resources`, `states`, `events`,
 `exit-codes` and `config`. `qex schema job|status|event` gives the JSON Schema

@@ -158,6 +158,9 @@ pub const CEILING_VARIABLE: &str = "QEX_COORDINATOR_CEILING_SECS";
 const LARGEST_CEILING: Duration = Duration::from_secs(24 * 60 * 60);
 
 fn ceiling() -> Duration {
+    if let Some(limit) = RPC_TIMEOUT.get() {
+        return *limit;
+    }
     match std::env::var(CEILING_VARIABLE)
         .ok()
         .and_then(|v| v.trim().parse::<u64>().ok())
@@ -167,6 +170,13 @@ fn ceiling() -> Duration {
         }
         _ => COORDINATOR_CEILING,
     }
+}
+
+static RPC_TIMEOUT: std::sync::OnceLock<Duration> = std::sync::OnceLock::new();
+
+/// Set before the first connection. Each operation receives a fresh budget.
+pub fn set_rpc_timeout(limit: Duration) {
+    let _ = RPC_TIMEOUT.set(limit);
 }
 
 /// Gives the moment at which ONE operation stops waiting for an answer.
@@ -237,7 +247,16 @@ fn as_the_reader_gave(limit: Duration) -> String {
 /// A message that names a limit is the evidence of the reader about which
 /// limit ended their command: their own number, or the ceiling of qex.
 fn the_limit_that_ended_it() -> String {
-    name_the_limit(spent_limit_of_the_reader())
+    let spent = spent_limit_of_the_reader();
+    if spent.is_none() {
+        if let Some(limit) = RPC_TIMEOUT.get() {
+            return format!(
+                "Your `--rpc-timeout {}` ended this operation.",
+                as_the_reader_gave(*limit)
+            );
+        }
+    }
+    name_the_limit(spent)
 }
 
 /// Writes the sentence of `the_limit_that_ended_it` for a limit that passed.
@@ -437,8 +456,8 @@ fn say_that_qex_still_waits(since: Instant, deadline: Instant, what: &str) {
     } else {
         eprintln!(
             "qex: still waiting for the coordinator: {what}. \
-             qex gives this answer {} more, and `--timeout` gives the \
-             command a shorter limit.",
+             qex gives this answer {} more. Use `--rpc-timeout` for a \
+             shorter coordinator operation limit.",
             seconds(left)
         );
     }
@@ -645,12 +664,14 @@ impl Client {
                     .to_string(),
             ));
         }
-        self.send(request)?;
+        self.send_within(request, deadline)?;
 
         // A caller that set its own limit keeps it. `qex logs --follow` and the
         // reporter of a wait each hold a limit that belongs to their own work.
-        let ours = self.stream.read_timeout().ok().flatten().is_none();
-        if !ours {
+        let previous_timeout = self.stream.read_timeout().ok().flatten();
+        if previous_timeout
+            .is_some_and(|time| time <= deadline.saturating_duration_since(Instant::now()))
+        {
             return self.recv();
         }
 
@@ -687,7 +708,7 @@ impl Client {
                     }
                     self.set_read_timeout(Some(left)).ok();
                     let got = self.recv();
-                    self.set_read_timeout(None).ok();
+                    self.set_read_timeout(previous_timeout).ok();
                     // A read that reached the limit took the first part of a
                     // line and lost it, so this connection can no longer say
                     // where one answer ends and the next begins. The flag below
@@ -721,10 +742,26 @@ impl Client {
     }
 
     pub fn send(&mut self, request: &Request) -> Result<()> {
+        self.send_within(request, deadline_for_one_wait())
+    }
+
+    fn send_within(&mut self, request: &Request, deadline: Instant) -> Result<()> {
         let mut line = serde_json::to_string(request).context("writing the request")?;
         line.push('\n');
-        self.write_quietly(line.as_bytes())
-            .context("sending the request to the coordinator")?;
+        let started = Instant::now();
+        if let Err(error) = self.write_quietly(line.as_bytes(), deadline) {
+            self.lost_its_place = true;
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+            ) {
+                return Err(timed_out(format!(
+                    "the coordinator did not take the request in {}. {} Run `qex info --no-start` to check it before submitting again; a partial request may have arrived.",
+                    seconds(started.elapsed()), the_limit_that_ended_it()
+                )));
+            }
+            return Err(anyhow::Error::new(error).context("sending the request to the coordinator"));
+        }
         self.stream.flush().ok();
         Ok(())
     }
@@ -734,11 +771,16 @@ impl Client {
     /// A coordinator that closed the connection gives `EPIPE` here, and the
     /// caller then reports it with a message and a code. Without this, the
     /// write would stop the process with a signal and say nothing.
-    fn write_quietly(&mut self, bytes: &[u8]) -> std::io::Result<()> {
+    fn write_quietly(&mut self, bytes: &[u8], deadline: Instant) -> std::io::Result<()> {
         use std::os::unix::io::AsRawFd;
         let fd = self.stream.as_raw_fd();
         let mut sent = 0;
         while sent < bytes.len() {
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                return Err(std::io::ErrorKind::TimedOut.into());
+            }
+            self.stream.set_write_timeout(Some(left))?;
             #[cfg(target_vendor = "apple")]
             let flags = 0;
             #[cfg(not(target_vendor = "apple"))]
@@ -761,6 +803,7 @@ impl Client {
             }
             return Err(e);
         }
+        self.stream.set_write_timeout(None)?;
         Ok(())
     }
 
@@ -1045,7 +1088,9 @@ fn reject_connect_refusal(socket: &Path, error: std::io::Error) -> Result<()> {
 
 /// Waits until the new coordinator opens its socket.
 fn wait_for_socket(socket: &Path, timeout: Duration) -> Result<UnixStream> {
-    let deadline = Instant::now() + timeout;
+    let startup_deadline = Instant::now() + timeout;
+    let operation_deadline = deadline_for_one_wait();
+    let deadline = startup_deadline.min(operation_deadline);
     let mut delay = Duration::from_millis(2);
     // Test the socket itself after a SHORT wait, and not at the end.
     //
@@ -1061,7 +1106,8 @@ fn wait_for_socket(socket: &Path, timeout: Duration) -> Result<UnixStream> {
         // whole wait. A socket that is there and gives no answer is not a
         // refusal here: the coordinator is starting, and the next attempt asks
         // again.
-        match paths::connect_within(socket, delay) {
+        let left = deadline.saturating_duration_since(Instant::now());
+        match paths::connect_within(socket, delay.min(left)) {
             paths::Connected::Open(stream) => return Ok(stream),
             paths::Connected::Failed(error) => {
                 reject_connect_refusal(socket, error)?;
@@ -1074,7 +1120,7 @@ fn wait_for_socket(socket: &Path, timeout: Duration) -> Result<UnixStream> {
                 bail!("{message}");
             }
         }
-        std::thread::sleep(delay);
+        std::thread::sleep(delay.min(deadline.saturating_duration_since(Instant::now())));
         // Increase the delay slowly. A coordinator usually starts in a few
         // milliseconds, and a long delay makes each command slow.
         delay = (delay * 2).min(Duration::from_millis(50));
@@ -1095,6 +1141,12 @@ fn wait_for_socket(socket: &Path, timeout: Duration) -> Result<UnixStream> {
     // Give the last lines of the log here as well. A reader that must open a
     // file to learn the cause frequently does not open it.
     let tail = last_lines_of(&log, 5);
+    if operation_deadline <= startup_deadline {
+        return Err(timed_out(format!(
+            "the coordinator did not open its socket before the operation limit. {}\nIts log file is {}{}",
+            the_limit_that_ended_it(), log.display(), tail
+        )));
+    }
     bail!(
         "the coordinator did not start in {} seconds.\n\
          Its log file is {}{}",
@@ -1553,6 +1605,42 @@ mod tests {
             said.contains("question that you did not ask"),
             "the fault must say what it prevented: {said}"
         );
+    }
+
+    #[test]
+    fn an_rpc_deadline_bounds_a_call_with_a_longer_socket_timeout() {
+        let (ours, _theirs) = UnixStream::pair().unwrap();
+        let mut client = Client::with_stream(ours).unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .unwrap();
+        let start = Instant::now();
+        let answer = client.call_within(&Request::Info, start + Duration::from_millis(100));
+        assert!(is_a_coordinator_timeout(&answer.unwrap_err()));
+        assert!(start.elapsed() < Duration::from_secs(5));
+        assert_eq!(
+            client.stream.read_timeout().unwrap(),
+            Some(Duration::from_secs(10))
+        );
+        assert!(client.lost_its_place);
+    }
+
+    #[test]
+    fn an_rpc_deadline_bounds_a_request_the_coordinator_does_not_read() {
+        let (ours, _theirs) = UnixStream::pair().unwrap();
+        let mut client = Client::with_stream(ours).unwrap();
+        let start = Instant::now();
+        let error = client
+            .write_quietly(
+                &vec![b'x'; 8 * 1024 * 1024],
+                start + Duration::from_millis(100),
+            )
+            .unwrap_err();
+        assert!(matches!(
+            error.kind(),
+            std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+        ));
+        assert!(start.elapsed() < Duration::from_secs(5));
     }
 
     /// A time in a message is the time that qex measured. A floor of one

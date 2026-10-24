@@ -354,6 +354,23 @@ continues it. The time that the machine is off counts also; run `qex help
 states`. There is no limit by default: work that a person wanted is work
 that qex does not discard for you.
 
+Timeout names
+-------------
+
+`--job-timeout` is an alias of `--timeout` on submit and run. It limits the
+job run. `--queue-timeout` is an alias of `--max-queue-time`. It limits queue
+admission. `--wait-timeout` limits observation on submit, status, wait and
+events. On status, wait and events, the older `--timeout` means the same.
+The job continues when observation ends.
+
+`--rpc-timeout 10s` limits each coordinator operation. It does not limit the
+wait for a job to finish. The default is 5m. Give a positive time of at most
+one day. A shorter observation limit also bounds coordinator operations.
+
+`qex describe --json` lists the actual commands, argument shapes and published
+output schemas. Protocol capabilities are listed separately. They name
+coordinator features and are not CLI command names.
+
 Other options
 -------------
 
@@ -874,6 +891,13 @@ qex says the line ONE TIME for each release, on stderr, so
 
     qex version --check          ask now, and say what the answer was
     qex version --check --json   the same answer for a program
+
+`qex --version` and `qex version --client` read only the client identity.
+They never contact or start a coordinator. Add `--json` to `version --client`
+for a program. Plain `qex version` also checks the coordinator without
+starting one. If the coordinator is unreachable, the command still gives the
+client version, reports the socket fault, and exits with a failure. An
+unreachable coordinator has an unknown `running` value (`null`) in JSON.
 
 That command asks at the moment that you run it, because you asked it to. It
 gives 0 when the answer arrived, whatever the answer says, and 1 when qex could
